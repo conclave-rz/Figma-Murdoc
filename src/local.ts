@@ -134,14 +134,15 @@ class LocalFigmaConsoleMCP {
 	> = new Map();
 
 	constructor() {
+		// Instrucciones de Murdoc: figma-murdoc.md vive en la raíz del repo (dist/local.js → ../)
 		const murdocMd = (() => {
-		try {
-			const { readFileSync } = require('fs');
-			const { join, dirname } = require('path');
-			const { fileURLToPath } = require('url');
 			const __d = dirname(fileURLToPath(import.meta.url));
-			return readFileSync(join(__d, '../../figma-murdoc.md'), 'utf-8');
-		} catch { return ''; }
+			const candidates = [join(__d, '../figma-murdoc.md'), join(__d, '../../figma-murdoc.md')];
+			for (const candidatePath of candidates) {
+				if (existsSync(candidatePath)) return readFileSync(candidatePath, 'utf-8');
+			}
+			logger.warn({ candidates }, 'figma-murdoc.md no encontrado; se omiten las instrucciones de Murdoc');
+			return '';
 		})();
 
 		this.server = new McpServer(
