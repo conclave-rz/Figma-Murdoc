@@ -1,182 +1,113 @@
 # sync-tokens
 
-Skill para sincronizar tokens entre Figma y el codebase, en **ambas direcciones**. Exporta las variables de Figma como CSS custom properties, Tailwind config, JSON, Sass o **DTCG (W3C)**; e importa DTCG (`design.tokens.json`) creando variables en Figma. Mantiene sincronizados el sistema de diseño y el código.
+Skill para sincronizar tokens entre Figma y el codebase, en **ambas direcciones**, sobre las tools nativas `figma_export_tokens` y `figma_import_tokens` (diff-aware, con dry-run, detección de conflictos y round-trip por IDs de variable). Exporta a DTCG, CSS, Tailwind v3/v4, SCSS, TS o JSON; importa DTCG (`design.tokens.json`) a variables de Figma.
 
 ## Prerequisito
 Carga figma-use antes de ejecutar este skill.
 
-## Cuando usar este skill
-- Cuando development necesita los tokens actualizados del DS (export)
-- Cuando hay cambios en variables de Figma que deben reflejarse en código (export)
-- Cuando el contrato del Pilar 0 (`design.tokens.json` DTCG) debe entrar a Figma (import)
-- Para hacer el setup inicial de tokens en un proyecto nuevo
-- Para detectar drift entre los tokens de Figma y los del codebase
-- Para hacer round-trip DTCG: código → Figma → código sin pérdida
+## Regla de oro
+**No reimplementes el export/import con `figma_execute`.** Las tools nativas ya resuelven alias entre colecciones, modos, dimensiones DTCG `{value, unit}`, diff contra el estado actual y la protección contra sobrescribir archivos con un export vacío. `figma_execute` queda solo como diagnóstico.
 
-## Dirección
-- `export` (default): Figma → código
-- `import`: código (DTCG) → Figma
+## Cuando usar este skill
+- Development necesita los tokens actualizados del DS (export)
+- Cambios en variables de Figma que deben llegar a código (export)
+- El contrato del Pilar 0 (`design.tokens.json` DTCG) debe entrar a Figma (import)
+- Setup inicial de tokens en un proyecto nuevo
+- Detectar drift entre Figma y código (dry-run en cualquiera de las dos direcciones)
+- Round-trip DTCG código → Figma → código sin pérdida
 
 ## Parámetros disponibles
 - `direccion`: export · import (default: export)
-- `formato`: css · tailwind · json · sass · **dtcg** (default: css) — aplica a export
-- `archivo`: ruta del `design.tokens.json` a importar (default: `docs/contract-reference/tokens/design.tokens.json`) — aplica a import
-- `colecciones`: todas · [nombre-específico] (default: todas)
+- `formato` (export): **dtcg** · css · tailwind · tailwind-v3 · scss · ts · json (default: css)
+- `archivo` (import): ruta del DTCG (default: `docs/contract-reference/tokens/design.tokens.json`)
+- `colecciones`: todas · [nombres] (default: todas)
 - `modo`: light · dark · todos (default: todos)
 
-## Pasos de ejecución
+### Mapeo `formato` → `figma_export_tokens.format`
+| formato | format nativo | Notas |
+|---|---|---|
+| dtcg | `dtcg` | **Contrato del Pilar 0: `dtcgDialect: "2025"`** (dimensiones y colores como objeto). Sin contrato: dialecto `legacy` (hex string, máxima compatibilidad). |
+| css | `css-vars` | Selectores por modo (`:root`, `.dark`, `[data-theme=…]`) |
+| tailwind | `tailwind-v4` | `@theme inline` |
+| tailwind-v3 | `tailwind-v3` | `theme.extend` |
+| scss | `scss` | Variable primaria + mapa por modo |
+| ts | `ts-module` | `export const tokens = {…} as const` |
+| json | `json-nested` (o `json-flat`) | Para scripts propios |
 
-### Paso 1 — Leer todas las variables
+---
+
+## DIRECCIÓN: export (Figma → código)
+
+### Paso 1 — Resumen y confirmación
 ```
-- figma_get_variables con format='full' → obtener todas las colecciones, modos y valores
-- Mostrar al usuario un resumen: X variables en Y colecciones con Z modos
-- Confirmar qué colecciones y modos exportar
-```
-
-### Paso 2 — Transformar según formato
-
-#### CSS custom properties
-```css
-:root {
-  /* Colores - modo light */
-  --color-primary: #007AFF;
-  --color-primary-hover: #0056CC;
-
-  /* Tipografía */
-  --font-size-base: 16px;
-  --font-size-lg: 20px;
-
-  /* Espaciado */
-  --spacing-xs: 4px;
-  --spacing-sm: 8px;
-}
-
-[data-theme="dark"] {
-  --color-primary: #4DA3FF;
-}
+- figma_get_variables (verbosity: "summary") → X variables en Y colecciones con Z modos
+- Confirmar colecciones y modos a exportar (collectionIds / modes)
 ```
 
-#### Tailwind config
-```javascript
-module.exports = {
-  theme: {
-    extend: {
-      colors: {
-        primary: 'var(--color-primary)',
-        'primary-hover': 'var(--color-primary-hover)',
-      },
-      fontSize: {
-        base: 'var(--font-size-base)',
-      },
-      spacing: {
-        xs: 'var(--spacing-xs)',
-      }
-    }
-  }
-}
+### Paso 2 — Previsualizar sin escribir
+```
+- figma_export_tokens { format, collectionIds?, modes?, dtcgDialect?, strategy: "dry-run" }
+- Si existe un archivo destino, la respuesta trae el diff: tokens nuevos, eliminados y cambiados.
+- Mostrar el diff al usuario y pedir confirmación.
 ```
 
-#### JSON (W3C Design Tokens format)
-```json
-{
-  "color": {
-    "primary": { "$value": "#007AFF", "$type": "color" },
-    "primary-hover": { "$value": "#0056CC", "$type": "color" }
-  },
-  "fontSize": {
-    "base": { "$value": "16px", "$type": "dimension" }
-  }
-}
+### Paso 3 — Escribir
+```
+- figma_export_tokens { ..., outputPath: "<ruta del archivo>", strategy: "merge" }
+- "merge" se niega a escribir si el export sobrescribiría tokens que solo existen en el archivo:
+  reportarlo y preguntar antes de usar "replace".
+- Con tokens.config.json en la raíz del proyecto, la tool puede llamarse sin argumentos (lee formatos, rutas y modos del config).
 ```
 
-#### Sass variables
-```scss
-// Colores
-$color-primary: #007AFF;
-$color-primary-hover: #0056CC;
-
-// Tipografía
-$font-size-base: 16px;
-```
-
-#### DTCG (W3C Design Tokens 2025.10) — formato del contrato del Pilar 0
-Export fiel al estándar que consume el Pilar 0. Reglas:
-- Estructura en tres niveles si las colecciones de Figma lo permiten: `primitive` → `semantic` → `component`. Si el archivo tiene colecciones `Contract / Primitive|Semantic|Component` (creadas por `apply-contract`), mapéalas 1:1 a esos niveles.
-- **Dimensiones como objeto** `{ "value": 16, "unit": "px" }`, nunca `"16px"`.
-- **Alias de variable de Figma → referencia DTCG** `{ruta.con.puntos}`. Ej: una var `color/bg/base` que aliasa a `color/neutral/0` de la colección Primitive se exporta como `"$value": "{primitive.color.neutral.0}"`.
-- `$type` por token (`color`, `dimension`, `fontFamily`, `fontWeight`), heredable por grupo.
-```json
-{
-  "primitive": {
-    "color": { "$type": "color", "neutral": { "0": { "$value": "#FFFFFF" } } },
-    "space": { "$type": "dimension", "4": { "$value": { "value": 16, "unit": "px" } } }
-  },
-  "semantic": {
-    "color": { "$type": "color", "bg": { "base": { "$value": "{primitive.color.neutral.0}" } } }
-  },
-  "component": {
-    "button": { "primary": { "bg": { "$type": "color", "$value": "{semantic.color.accent}" } } }
-  }
-}
-```
-> Los componentes referencian **semántico**, nunca primitivo (regla dura del contrato). Si detectas una var de componente aliaseada directo a primitivo, avísalo en el reporte.
-
-### Paso 3 — Detectar drift (opcional)
-Si el usuario tiene un archivo de tokens existente:
-```
-- Comparar variables de Figma con tokens actuales del codebase
-- Listar variables nuevas (en Figma, no en código)
-- Listar variables eliminadas (en código, no en Figma)
-- Listar variables con valores distintos
-```
-
-### Paso 4 — Entregar los tokens
-- Mostrar el código generado en la conversación
-- Indicar qué archivo del proyecto debe actualizarse
-- Si hay drift, mostrar primero el diff y pedir confirmación
-
-## Convenciones de naming en la exportación
-- Usar kebab-case para todos los nombres
-- Prefijo por tipo: color-, font-, spacing-, radius-, shadow-
-- Mantener la jerarquía de las colecciones de Figma: color-brand-primary
+> **Regla dura del contrato:** los componentes referencian **semántico**, nunca primitivo. Si el export muestra una variable de componente aliaseada directo a primitivo, avísalo en el reporte.
 
 ---
 
 ## DIRECCIÓN: import (DTCG → Figma)
 
-Cuando `direccion=import`, lee un `design.tokens.json` (DTCG) y crea las variables en Figma. **Este skill no reimplementa el alta de variables: delega en `apply-contract`**, que ya sabe parsear DTCG de tres niveles, resolver referencias `{...}` como alias entre colecciones y manejar dimensiones `{value, unit}`.
-
-### Paso 1 — Localizar el archivo
+### Paso 1 — Localizar y validar
 ```
-- Usar `archivo` (default: docs/contract-reference/tokens/design.tokens.json)
-- Validar que es DTCG (tiene niveles primitive/semantic/component o al menos tokens con $type/$value)
-```
-
-### Paso 2 — Delegar el alta de variables
-```
-- Invocar apply-contract con alcance=tokens sobre ese archivo:
-  crea Contract / Primitive, Contract / Semantic, Contract / Component con los alias correctos.
-- No dupliques la lógica aquí; apply-contract es la única ruta de creación de variables desde DTCG.
+- Leer `archivo` (default: docs/contract-reference/tokens/design.tokens.json)
+- Validar que es DTCG: tokens con $type/$value; los grupos de primer nivel son los sets
+  (en el contrato: primitive · semantic · component)
 ```
 
-### Paso 3 — Reportar y verificar drift de import
+### Paso 2 — Dry-run (siempre primero)
 ```
-- Reportar variables creadas/actualizadas por nivel.
-- Si ya existían colecciones Contract/*, mostrar diff (nuevas, cambiadas, eliminadas) y pedir confirmación antes de sobreescribir.
+- figma_import_tokens {
+    files: [{ path: "<archivo>", content: "<contenido>" }],   // o payload: "<contenido>"
+    collectionMapping: { primitive: "Contract / Primitive",
+                         semantic:  "Contract / Semantic",
+                         component: "Contract / Component" },   // solo para el contrato del Pilar 0
+    dryRun: true
+  }
+- Mostrar el plan: colecciones/variables a crear, valores a actualizar, conflictos.
 ```
+
+### Paso 3 — Aplicar
+```
+- figma_import_tokens { ...mismos args, dryRun: false, strategy: "merge" }
+- Conflictos (cambió en Figma y en código desde el último sync): onConflict "ask" (default) no escribe;
+  preguntar al usuario y reintentar con "figma-wins" o "code-wins".
+- Reportar variables creadas/actualizadas por colección.
+```
+
+`apply-contract` usa exactamente este import para su Paso 2; no dupliques la lógica.
+
+---
 
 ## Round-trip (aceptación)
-Verifica que al menos un token sobrevive el ciclo **código → Figma → código sin pérdida**:
-1. Parte de un token DTCG conocido (ej. `semantic.color.accent = {primitive.color.blue.500}` → `#4F46E5`).
-2. `import` → crea la variable en Figma (alias semántico→primitivo).
-3. `export formato=dtcg` → vuelve a emitir DTCG.
-4. Compara: el valor resuelto y la referencia `{primitive.color.blue.500}` deben conservarse (mismo hex, misma cadena de alias). Reporta cualquier pérdida (alias colapsado a literal, dimensión convertida a string, nivel perdido).
+Al menos un token sobrevive **código → Figma → código** sin pérdida:
+1. Token conocido: `semantic.color.bg.base = {primitive.color.neutral.0}`.
+2. `import` (Paso 2–3) → la variable `color/bg/base` en `Contract / Semantic` queda como alias de `color/neutral/0` en `Contract / Primitive`.
+3. `export formato=dtcg` con `dtcgDialect: "2025"`.
+4. Comparar: misma referencia `{primitive.color.neutral.0}`, mismo valor resuelto, dimensiones como `{value, unit}`. Los IDs de variable viajan en `$extensions["figma-console-mcp"]`, así que un rename no duplica.
+5. Reportar cualquier pérdida (alias colapsado a literal, dimensión convertida a string, set perdido).
 
 ## Ejemplos de uso
 - "Exporta todos los tokens como CSS variables"
-- "Dame el config de Tailwind con los colores del DS"
-- "Genera los tokens en formato JSON para Style Dictionary"
-- "Exporta los tokens en formato DTCG para el contrato del Pilar 0"
+- "Dame el config de Tailwind v4 con los colores del DS"
+- "Exporta los tokens en DTCG para el contrato del Pilar 0"
 - "Importa el design.tokens.json del contrato a Figma"
-- "Haz el round-trip del token de acento y verifica que no se pierde"
-- "¿Hay diferencias entre los tokens de Figma y los de nuestro código?"
+- "¿Hay diferencias entre los tokens de Figma y los de nuestro código?" (dry-run)
+- "Haz el round-trip del token de fondo base y verifica que no se pierde"

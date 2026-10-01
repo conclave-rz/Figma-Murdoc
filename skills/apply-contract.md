@@ -74,22 +74,22 @@ Se crean **tres colecciones**, una por nivel, en este orden (por las referencias
   - Ej: `semantic.color.bg.base` con `$value: "{primitive.color.neutral.0}"` → variable `color/bg/base` en `Contract / Semantic`, aliaseada a `color/neutral/0` de `Contract / Primitive`.
 - **Dimensiones DTCG** vienen como objeto `{ "value": 16, "unit": "px" }`, **no** como `"16px"`. Extrae `.value`.
 
-#### Ejecución
-1. Crear colecciones (o usar `figma_setup_design_tokens` / `figma_create_variable_collection`).
-2. Primero **todas** las variables de `Contract / Primitive` con valores crudos.
-3. Luego `Contract / Semantic` resolviendo cada `{primitive.*}` al id de la variable ya creada (alias).
-4. Luego `Contract / Component` resolviendo cada `{semantic.*}` (alias). Si un componente apunta a `{primitive.*}`, **avisa**: viola la regla dura del contrato.
+#### Ejecución (tool nativa — v3)
+Las reglas de arriba describen el resultado esperado; **la ejecución ya no es manual**. `figma_import_tokens` parsea DTCG 2025.10, toma los grupos de primer nivel como sets (`primitive` · `semantic` · `component`), crea primero los literales y luego los alias, y conserva las dimensiones `{value, unit}`.
 
-> **⚠️ Reglas figma_execute (ver figma-use):** APIs async con `await`; alias con `boundVariables`/`setValueForMode` usando `{ type: "VARIABLE_ALIAS", id }`; `timeout: 25000` para altas masivas de variables; devolver solo `{ collectionId, count }`, no los objetos completos.
+1. **Dry-run** (siempre primero):
+   ```
+   figma_import_tokens {
+     files: [{ path: "docs/contract-reference/tokens/design.tokens.json", content: "<contenido>" }],
+     collectionMapping: { primitive: "Contract / Primitive", semantic: "Contract / Semantic", component: "Contract / Component" },
+     dryRun: true
+   }
+   ```
+   Muestra el plan (colecciones y variables a crear, cambios, conflictos) y pide confirmación.
+2. **Aplicar**: mismos argumentos con `dryRun: false`. Si hay conflictos (`onConflict: "ask"`), pregunta antes de reintentar con `figma-wins` o `code-wins`.
+3. **Verificar la regla dura**: con `figma_export_tokens { format: "dtcg", dtcgDialect: "2025", strategy: "dry-run" }`, confirma que ninguna variable de `Contract / Component` aliasa directo a `Contract / Primitive`. Si alguna lo hace, **avisa**: viola el contrato.
 
-**Patrón de alias entre colecciones:**
-```javascript
-// var semántica que aliasa a una primitiva ya creada
-const prim = await figma.variables.getVariableByIdAsync(primIdPorNombre["color/neutral/0"]);
-const sem = figma.variables.createVariable("color/bg/base", semanticCollection, "COLOR");
-sem.setValueForMode(modeId, { type: "VARIABLE_ALIAS", id: prim.id });
-return { id: sem.id, name: sem.name };
-```
+> **Fallback (solo si la tool nativa no está disponible, p. ej. un servidor viejo):** crear las colecciones con `figma_execute` en el orden Primitive → Semantic → Component, con APIs async y alias `{ type: "VARIABLE_ALIAS", id }`, `timeout: 25000`, devolviendo solo `{ collectionId, count }`.
 
 ### Paso 3 — Componentes del registry → stubs con nomenclatura
 
