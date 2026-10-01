@@ -1903,14 +1903,27 @@ figma.ui.onmessage = async (msg) => {
       var component = null;
       var instance = null;
 
-      // Try published library first (by key), then fall back to local component (by nodeId)
-      if (msg.componentKey) {
+      // Local primero (por nodeId). importComponentByKeyAsync nunca resuelve con un componente
+      // local NO publicado: se quedaba esperando su timeout y el servidor cortaba a los 15s
+      // antes de llegar al fallback local. Si el nodeId resuelve, no se intenta importar.
+      var localNode = null;
+      if (msg.nodeId) {
+        localNode = await figma.getNodeByIdAsync(msg.nodeId);
+        if (localNode && localNode.type === 'COMPONENT') {
+          component = localNode;
+        }
+      }
+      var localResolved = localNode && (localNode.type === 'COMPONENT' || localNode.type === 'COMPONENT_SET');
+
+      // Librería publicada (por key). Timeouts de 10s cada uno: la suma (20s) queda por debajo del
+      // timeout de 25s que usa el servidor para este comando, así el plugin siempre responde con un error útil.
+      if (!component && !localResolved && msg.componentKey) {
         // Try importComponentByKeyAsync first (for COMPONENT nodes)
         try {
           var importResult = await Promise.race([
             figma.importComponentByKeyAsync(msg.componentKey),
             new Promise(function(_, reject) {
-              setTimeout(function() { reject(new Error('Import timed out after 15s — component may not be published to a team library')); }, 15000);
+              setTimeout(function() { reject(new Error('Import timed out after 10s — component may not be published to a team library')); }, 10000);
             })
           ]);
           component = importResult;
@@ -1925,7 +1938,7 @@ figma.ui.onmessage = async (msg) => {
             var setResult = await Promise.race([
               figma.importComponentSetByKeyAsync(msg.componentKey),
               new Promise(function(_, reject) {
-                setTimeout(function() { reject(new Error('ComponentSet import timed out after 15s')); }, 15000);
+                setTimeout(function() { reject(new Error('ComponentSet import timed out after 10s')); }, 10000);
               })
             ]);
             // Got the component set — use its default variant (first child)

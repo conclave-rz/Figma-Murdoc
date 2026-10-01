@@ -271,7 +271,8 @@ export class WebSocketConnector implements IFigmaConnector {
       if (options.variant) params.variant = options.variant;
       if (options.parentId) params.parentId = options.parentId;
     }
-    return this.wsServer.sendCommand('INSTANTIATE_COMPONENT', params);
+    // 25s: cubre los dos intentos de import por key del plugin (10s c/u) para que devuelva su error y no un timeout
+    return this.wsServer.sendCommand('INSTANTIATE_COMPONENT', params, 25000);
   }
 
   async createComponentSet(params: {
