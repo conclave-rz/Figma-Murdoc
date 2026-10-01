@@ -123,33 +123,37 @@ FormSection (Component)
 6. **Dejar vacío** cuando el contenido es siempre único
 7. **Min width/height** para que el slot no colapse a 0 cuando está vacío
 
-### Código para crear frame slot-ready:
+### Crear el slot (Murdoc v3)
 
+Para un componente nuevo, crea el slot directamente con la tool nativa (ya trae la propiedad SLOT ligada):
+```
+figma_create_slot { nodeId: "<COMPONENT_ID>", name: "slot-body", layoutMode: "VERTICAL", width: 320, height: 120 }
+```
+Si ya construiste el frame con las reglas de arriba (hijo directo del componente), conviértelo:
+```
+figma_add_slot_property { nodeId: "<COMPONENT_ID>", propertyName: "Body", frameNodeId: "<SLOT_FRAME_ID>",
+                          preferredValues: [ ...componentes sugeridos ] }
+```
+Para poblar una instancia: `figma_append_to_slot`; para vaciarla: `figma_reset_slot`.
+
+Frame slot-ready con `figma_execute` (cuando necesitas configurar auto layout fino antes de convertir), timeout 15000:
 ```javascript
-// ✅ Crear frame preparado para convertir a slot — timeout: 15000
 const parent = await figma.getNodeByIdAsync("COMPONENT_ID");
 const slotFrame = figma.createFrame();
 slotFrame.name = "slot-body";
 slotFrame.layoutMode = "VERTICAL";
-slotFrame.primaryAxisAlignItems = "MIN";
-slotFrame.counterAxisAlignItems = "MIN";
 slotFrame.primaryAxisSizingMode = "AUTO"; // hug
-slotFrame.counterAxisSizingMode = "FILL"; // fill container
-slotFrame.itemSpacing = 8;
-slotFrame.fills = []; // transparente
-slotFrame.clipsContent = true;
+slotFrame.fills = [];
 slotFrame.minWidth = 100;
 slotFrame.minHeight = 40;
-parent.appendChild(slotFrame);
-
+parent.appendChild(slotFrame);              // hijo directo: requisito de figma_add_slot_property
+slotFrame.layoutSizingHorizontal = "FILL";  // fill container (después de appendChild)
 return { id: slotFrame.id, name: slotFrame.name };
-// El diseñador luego hace: click derecho → "Convert to slot"
 ```
 
 ### Lo que NO hacer:
-- No intentar `addComponentProperty("slot", "SLOT", ...)` — no existe en la API
-- No intentar `instance.setProperties()` con slot properties — lanza error
-- No crear slots en el top-level del componente — solo en frames anidados
+- No poblar slots con `instance.setProperties()` ni `figma_set_instance_properties` — lanza `cannotSetSlotProperty`; usa `figma_append_to_slot`
+- No usar GRID layout en un slot, ni anidar un slot dentro de otro
 - No crear un slot para cada pequeña variación — los slots son para contenido variable, no para estados
 
 ---
