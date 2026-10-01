@@ -22,13 +22,15 @@ Murdoc se sincroniza con upstream **figma-console-mcp 1.40.8**, integra el pack 
 - `generate-showcase-page` pasa a ser alias de `generate-docsite`.
 
 ### Fixed
-- **`figma_instantiate_component` se colgaba 15 s** con `componentKey` + `nodeId` de un componente local: el bridge importaba por key primero (nunca resuelve sin publicar) y el servidor cortaba antes del fallback local; la instancia aparecía después, huérfana. Ahora resuelve el `nodeId` primero. El diagnóstico anterior (dynamic-page) era incorrecto.
+- **`figma_instantiate_component` se colgaba 15 s** con `componentKey` + `nodeId` de un componente local: el bridge importaba por key primero (nunca resuelve sin publicar) y el servidor cortaba antes del fallback local; la instancia aparecía después, huérfana. Ahora resuelve el `nodeId` primero. El diagnóstico anterior (dynamic-page) era incorrecto. Verificado en vivo con el plugin 3.0.0: ~1.7 s con key + nodeId; key inválida → error en 0.6 s, sin huérfanas.
 - **Las instrucciones de `figma-murdoc.md` nunca se cargaban**: `require()` en ESM (el error se ignoraba) y una ruta que salía del repo.
 - **`list_skills` no mostraba skills en carpeta** (p. ej. `html-to-figma`) y tomaba `---` como descripción de skills con frontmatter.
 - El paquete no publicaba `skills/` ni `figma-murdoc.md`.
 - Ejemplo inválido `counterAxisSizingMode = "FILL"` en `slot-patterns`.
 
 ### Notes
+- **Reimporta el plugin desde `~/.figma-console-mcp/plugin/manifest.json`.** En la verificación de v3 se encontró que Figma corría un plugin 1.14.0 importado desde un clon viejo de upstream: ningún fix del plugin de v2 había llegado a ejecutarse.
+- `figma_import_tokens` en dry-run sobre un DS real marca como `toDelete` todas las variables ajenas al DTCG; usa siempre `strategy: "merge"` (ver `sync-tokens`).
 - Se restaura `puppeteer-core` (upstream lo quitó al eliminar CDP) porque la captura viva local de `figma_capture_html` lo necesita.
 
 ## [2.0.0] — Murdoc v2
