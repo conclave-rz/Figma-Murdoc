@@ -5,7 +5,33 @@ All notable changes to Figma Console MCP will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] — Murdoc v2
+## [3.0.0] — Murdoc v3 — 2026-10-01
+
+Murdoc se sincroniza con upstream **figma-console-mcp 1.40.8**, integra el pack de skills de **ALX** y corrige los bugs encontrados al verificar v2 en vivo. Requiere **reimportar el plugin** Desktop Bridge (`PLUGIN_VERSION` 3.0.0).
+
+### Added
+- **Base upstream 1.40.8** (merge de 205 commits): slots (`figma_create_slot`, `figma_add_slot_property`, `figma_append_to_slot`, `figma_reset_slot`, `figma_get_slots`), `figma_export_tokens`/`figma_import_tokens` (DTCG 2025.10, diff, dry-run, conflictos), historial de versiones, auditoría de accesibilidad, `figma_execute_across_files`, `figma_ds_*`, `figma_diagnose` y bridge con heartbeat y handshake de versión.
+- **Skills de ALX**: `hu-alx`, `docu-alx` (con su plantilla), `generate-docsite` (evolución de figma-uikit-docsite v2) y `ai-ready-audit` (con modo Figma). Ver `CREDITS.md`.
+- **`generate-docsite/scripts/verify-site.mjs`**: verificación headless con el Chrome local (puppeteer-core): carga `file://`, un solo estado activo, contraste WCAG por apilado real, capturas light/dark, validación DTCG y modo `--offline`.
+- **Loader de skills v3**: skills en carpeta (`<name>/SKILL.md`) con `references/` por fase (`use_skill { skill, reference }`) y `assets/`; descripción desde frontmatter; `base: none` para omitir `figma-use`; nombres validados (sin path traversal).
+
+### Changed
+- `sync-tokens` y `apply-contract` usan las tools nativas de tokens en vez de crear variables con `figma_execute`.
+- `migrate-to-slots` y `slot-patterns` crean y pueblan slots con las tools nativas.
+- `reuse-first` agrega búsqueda de respaldo (exacta + fuzzy) cuando `figma_search_components` devuelve 0 o falla.
+- `generate-showcase-page` pasa a ser alias de `generate-docsite`.
+
+### Fixed
+- **`figma_instantiate_component` se colgaba 15 s** con `componentKey` + `nodeId` de un componente local: el bridge importaba por key primero (nunca resuelve sin publicar) y el servidor cortaba antes del fallback local; la instancia aparecía después, huérfana. Ahora resuelve el `nodeId` primero. El diagnóstico anterior (dynamic-page) era incorrecto.
+- **Las instrucciones de `figma-murdoc.md` nunca se cargaban**: `require()` en ESM (el error se ignoraba) y una ruta que salía del repo.
+- **`list_skills` no mostraba skills en carpeta** (p. ej. `html-to-figma`) y tomaba `---` como descripción de skills con frontmatter.
+- El paquete no publicaba `skills/` ni `figma-murdoc.md`.
+- Ejemplo inválido `counterAxisSizingMode = "FILL"` en `slot-patterns`.
+
+### Notes
+- Se restaura `puppeteer-core` (upstream lo quitó al eliminar CDP) porque la captura viva local de `figma_capture_html` lo necesita.
+
+## [2.0.0] — Murdoc v2
 
 Murdoc pasa a **consumir el contrato del Pilar 0** (tokens DTCG + registry shadcn + nomenclatura `category/role/variant`) como fuente de verdad. Radix deja de ser la única base. Total de skills: **19 → 22**.
 

@@ -2,19 +2,28 @@
 
 Fork del [Figma Console MCP](https://github.com/southleft/figma-console-mcp) extendido con un sistema de **Skills** para equipos de diseño. Conecta Claude con Figma Desktop para generar pantallas, documentar componentes, preparar handoffs y auditar sistemas de diseño — todo desde lenguaje natural.
 
+## Novedades de v3
+
+- **Base upstream 1.40.8** (antes 1.19): 124 tools — slots nativos, tokens export/import DTCG 2025.10 con diff y dry-run, historial de versiones, auditoría de accesibilidad, multi-archivo, extracción codebase → DS (`figma_ds_*`) y un bridge más estable (heartbeat, reconexión y handshake de versión).
+- **Fix real del cuelgue de `figma_instantiate_component`**: el bridge resuelve el componente local antes de importar por key (verificado en vivo).
+- **Pack de ALX**: `hu-alx` (Historias de Usuario), `docu-alx` (micrositio de HU), `generate-docsite` (sitio de documentación estilo Pattern Lab) y `ai-ready-audit` (scorecard de 8 dimensiones, también sobre Figma). Ver [CREDITS.md](CREDITS.md).
+- **Loader de skills v3**: skills en carpeta con `references/` por fase y `assets/`, frontmatter, y nombres validados.
+- **Skills migradas a tools nativas**: `sync-tokens` y `apply-contract` usan `figma_export_tokens`/`figma_import_tokens`; las de slots ya crean y pueblan slots; `reuse-first` tiene búsqueda de respaldo.
+- **Autónomo**: todo corre por el Desktop Bridge, sin cuotas ni seat Full. No depende del MCP oficial de Figma (ver más abajo).
+
 ## Qué añade este fork
 
 - **Sistema de Skills** — instrucciones en markdown que definen flujos de trabajo completos para diseñadores
 - **Loader dinámico** — los skills se leen en tiempo real sin recompilar ni reiniciar el servidor
 - **Instrucciones de arranque** — el servidor carga `figma-murdoc.md` al iniciar
-- **22 skills listos para usar** — cubre los workflows más comunes de un equipo de diseño
+- **27 skills listos para usar** — cubre los workflows más comunes de un equipo de diseño
 - **Orquestación inteligente** — mission planner con personas, pipelines con dependencias, review gates y auto-mejora (Nen)
 - **Integración con Radix UI** — sistema de diseño base accesible con skills por industria
 - **Soporte para Slots nativos** — auditoría, migración y patrones de composición con la nueva feature de Figma
 - **Specs de accesibilidad** — generación de specs para VoiceOver, TalkBack y ARIA
 - **Reglas de Plugin API** — documentación de errores comunes y mejores prácticas integrada en los skills
 
-## Skills disponibles (22)
+## Skills disponibles (27)
 
 ### Orquestación
 | Skill | Qué hace |
@@ -41,7 +50,8 @@ Fork del [Figma Console MCP](https://github.com/southleft/figma-console-mcp) ext
 | Skill | Qué hace |
 |---|---|
 | `generate-documentation` | Documenta componentes listos para Notion, Confluence o Storybook |
-| `generate-showcase-page` | Genera una página web con componentes documentados, tokens y flujos |
+| `generate-docsite` | Sitio de documentación multi-página estilo Pattern Lab (Atomic Design): specs, tokens DTCG, iconos SVG, código HTML/React/Vue/Angular, previews y verificación automática. *De ALX* |
+| `generate-showcase-page` | Alias de `generate-docsite` |
 
 ### Handoff a desarrollo
 | Skill | Qué hace |
@@ -54,13 +64,22 @@ Fork del [Figma Console MCP](https://github.com/southleft/figma-console-mcp) ext
 | Skill | Qué hace |
 |---|---|
 | `audit-quality` | Detecta drift del DS, problemas WCAG, valores hardcodeados y candidatos a migración de slots |
+| `ai-ready-audit` | Scorecard AI-Ready de 8 dimensiones (tokens, variantes, snippets, a11y, trazabilidad, estados, motion, red) sobre Figma y/o el sitio. *De ALX* |
 | `create-voice` | Genera specs de screen reader (VoiceOver, TalkBack, ARIA) desde diseños UI. Roles, labels, hints y orden de lectura |
 
 ### Slots nativos de Figma
 | Skill | Qué hace |
 |---|---|
-| `migrate-to-slots` | Audita librería para detectar candidatos a slots, reestructura componentes y prepara frames para "Convert to slot" |
+| `migrate-to-slots` | Audita la librería, reestructura componentes y los convierte en slots con las tools nativas (`figma_add_slot_property`, `figma_create_slot`) |
 | `slot-patterns` | Patrones de composición con slots para Card, Modal, ListItem, NavBar y FormSection |
+
+### Producto y requisitos (de ALX)
+| Skill | Qué hace |
+|---|---|
+| `hu-alx` | Entrevista guiada para descubrir y redactar Historias de Usuario sin inventar decisiones; separa confirmado, por validar, propuesta y hueco. Entrega Markdown |
+| `docu-alx` | Publica las HU como micrositio estático: menú, búsqueda, consulta local sin IA, imágenes contextuales (capturas reales desde Figma) y descarga en Markdown |
+
+> Flujo sugerido: `hu-alx` → `mission-planner` / `generate-screen` en Figma → `docu-alx` con capturas de las pantallas.
 
 ### Sistema de diseño con Radix UI
 | Skill | Qué hace |
@@ -120,12 +139,12 @@ Los slots son la nueva feature de Figma (open beta marzo 2026) que permite área
 **Estado de la Plugin API:**
 | Operación | Soportado |
 |---|---|
-| Detectar slots (`node.type === "SLOT"`) | ✅ |
-| Leer slot properties | ✅ |
-| Crear slots programáticamente | ❌ |
-| Modificar slots en instancias | ❌ |
+| Detectar y leer slots | ✅ `figma_get_slots` |
+| Crear slots | ✅ `figma_create_slot` |
+| Convertir un frame existente en slot | ✅ `figma_add_slot_property` |
+| Poblar / vaciar slots en instancias | ✅ `figma_append_to_slot` / `figma_reset_slot` |
 
-Murdoc puede auditar, reestructurar y preparar componentes para slots. El paso final "Convert to slot" lo hace el diseñador con un click.
+Murdoc puede auditar, reestructurar y migrar componentes a slots de punta a punta. "Convert to slot" manual queda como fallback para frames anidados.
 
 ## Flujo Radix UI → Figma → Showcase
 
@@ -176,6 +195,18 @@ Murdoc puede auditar, reestructurar y preparar componentes para slots. El paso f
 | `ecommerce` | ProductCard, CartItem, SizeSelector, FilterSidebar | Catálogo → Detalle → Carrito → Checkout |
 | `health` | DoctorCard, AppointmentSlot, HealthMetric, VitalChart | Buscar médico → Disponibilidad → Confirmar cita |
 | `saas` | StatCard, DataTable, Sidebar, CommandPalette | Dashboard → Detalle → Configuración |
+
+## Murdoc y el MCP oficial de Figma
+
+Desde 2026 el MCP oficial de Figma también escribe en el canvas (`use_figma`, `generate_figma_design`), pero exige seat Full para escribir, tiene cuotas de lectura (p. ej. 200 llamadas/día en Professional), limita las respuestas a 20 KB y anunció cobro por uso al terminar la beta. Murdoc corre todo por el Desktop Bridge local: sin cuotas, sin seat Full y sin depender del oficial.
+
+| Necesidad | Oficial | Murdoc |
+|---|---|---|
+| JS arbitrario sobre la Plugin API | `use_figma` | `figma_execute` |
+| Código → canvas | `generate_figma_design` | `figma_capture_html` |
+| Tokens | `get_variable_defs` (lectura) | `figma_export_tokens` / `figma_import_tokens` (bidireccional, DTCG) |
+| Code Connect | API de Figma (según plan) | `connect-codebase` → `code-connect.map.json` en el repo |
+| Consola, comentarios, anotaciones, versiones, lint, a11y | — | ✅ |
 
 ## Requisitos
 
@@ -236,7 +267,7 @@ En Claude Desktop escribe:
 list_skills
 ```
 
-Deberías ver los 22 skills disponibles.
+Deberías ver los 27 skills disponibles.
 
 ## Flujo de misión (orquestación)
 
@@ -351,6 +382,8 @@ figma-Murdoc/
 ## Créditos
 
 Basado en [figma-console-mcp](https://github.com/southleft/figma-console-mcp) por Southleft. Licencia MIT.
+
+Las skills `hu-alx`, `docu-alx`, `generate-docsite` y `ai-ready-audit` son de **ALX** (ver [CREDITS.md](CREDITS.md)).
 
 Desarrollado y extendido por Rz Inc.
 
