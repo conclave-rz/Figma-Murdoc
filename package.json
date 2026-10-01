@@ -13,7 +13,10 @@
 		"!dist/cloudflare",
 		"figma-desktop-bridge",
 		"README.md",
-		"LICENSE"
+		"LICENSE",
+		"skills",
+		"figma-murdoc.md",
+		"CREDITS.md"
 	],
 	"scripts": {
 		"prepublishOnly": "npm run build",
