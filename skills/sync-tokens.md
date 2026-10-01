@@ -92,6 +92,8 @@ Carga figma-use antes de ejecutar este skill.
 - Reportar variables creadas/actualizadas por colección.
 ```
 
+> **⚠️ Nunca uses `strategy: "replace"` en un archivo con otras colecciones.** En un DS real el dry-run reporta como `toDelete` todas las variables que no vienen en el DTCG (verificado: 772 variables de cliente en un import de 48 tokens del contrato). `merge` las conserva; `replace` las **borra permanentemente**. Usa `replace` solo en un archivo dedicado al contrato y con confirmación explícita del usuario tras mostrarle el conteo de `toDelete`.
+
 `apply-contract` usa exactamente este import para su Paso 2; no dupliques la lógica.
 
 ---

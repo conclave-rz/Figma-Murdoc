@@ -86,7 +86,8 @@ Las reglas de arriba describen el resultado esperado; **la ejecución ya no es m
    }
    ```
    Muestra el plan (colecciones y variables a crear, cambios, conflictos) y pide confirmación.
-2. **Aplicar**: mismos argumentos con `dryRun: false`. Si hay conflictos (`onConflict: "ask"`), pregunta antes de reintentar con `figma-wins` o `code-wins`.
+   > **⚠️ Nunca uses `strategy: "replace"` en un archivo con otras colecciones.** En un DS real el dry-run reporta como `toDelete` todas las variables que no vienen en el DTCG (verificado: 772 variables de cliente en un import de 48 tokens del contrato). `merge` las conserva; `replace` las **borra permanentemente**. Usa `replace` solo en un archivo dedicado al contrato y con confirmación explícita del usuario tras mostrarle el conteo de `toDelete`.
+2. **Aplicar**: mismos argumentos con `dryRun: false` y `strategy: "merge"`. Si hay conflictos (`onConflict: "ask"`), pregunta antes de reintentar con `figma-wins` o `code-wins`.
 3. **Verificar la regla dura**: con `figma_export_tokens { format: "dtcg", dtcgDialect: "2025", strategy: "dry-run" }`, confirma que ninguna variable de `Contract / Component` aliasa directo a `Contract / Primitive`. Si alguna lo hace, **avisa**: viola el contrato.
 
 > **Fallback (solo si la tool nativa no está disponible, p. ej. un servidor viejo):** crear las colecciones con `figma_execute` en el orden Primitive → Semantic → Component, con APIs async y alias `{ type: "VARIABLE_ALIAS", id }`, `timeout: 25000`, devolviendo solo `{ collectionId, count }`.
