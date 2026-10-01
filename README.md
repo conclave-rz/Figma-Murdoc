@@ -5,7 +5,7 @@ Fork del [Figma Console MCP](https://github.com/southleft/figma-console-mcp) ext
 ## Novedades de v3
 
 - **Base upstream 1.40.8** (antes 1.19): 124 tools — slots nativos, tokens export/import DTCG 2025.10 con diff y dry-run, historial de versiones, auditoría de accesibilidad, multi-archivo, extracción codebase → DS (`figma_ds_*`) y un bridge más estable (heartbeat, reconexión y handshake de versión).
-- **Fix real del cuelgue de `figma_instantiate_component`**: el bridge resuelve el componente local antes de importar por key (verificado en vivo).
+- **Fix real del cuelgue de `figma_instantiate_component`**: el bridge resuelve el componente local antes de importar por key (causa verificada en vivo: solo con `nodeId` responde al instante).
 - **Pack de ALX**: `hu-alx` (Historias de Usuario), `docu-alx` (micrositio de HU), `generate-docsite` (sitio de documentación estilo Pattern Lab) y `ai-ready-audit` (scorecard de 8 dimensiones, también sobre Figma). Ver [CREDITS.md](CREDITS.md).
 - **Loader de skills v3**: skills en carpeta con `references/` por fase y `assets/`, frontmatter, y nombres validados.
 - **Skills migradas a tools nativas**: `sync-tokens` y `apply-contract` usan `figma_export_tokens`/`figma_import_tokens`; las de slots ya crean y pueblan slots; `reuse-first` tiene búsqueda de respaldo.

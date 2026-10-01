@@ -50,7 +50,7 @@ return wanted.map(q => {
   return near && near.d <= 2 ? { q, match: near.c.name, nodeId: near.c.id, how: "fuzzy d=" + near.d } : { q, match: null };
 });
 ```
-Verificado en vivo: exacto, mayúsculas (`Action/Button/Primary`) y typo (`primaryy`, d=1) reusan; una pieza inexistente cae a GENERAR. Un match **fuzzy** se reporta al usuario antes de reusar.
+Verificado en vivo sobre un DS real (~50 páginas, 141 componentes; 1.2 s), donde `figma_search_components` tardó más de 120 s y devolvió 0: el nombre exacto, en mayúsculas y con typo (d=1) encuentran el componente; una pieza inexistente cae a GENERAR. Un match **fuzzy** se reporta al usuario antes de reusar.
 Registrar por cada pieza: `{ pieza, encontrada: si|no, fuente: registry|archivo|libreria|ninguna, ref }`.
 
 ### Paso 3 — Decidir reusar vs. generar
