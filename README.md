@@ -222,7 +222,7 @@ Desde 2026 el MCP oficial de Figma también escribe en el canvas (`use_figma`, `
 
 ### 1. Clonar, instalar y compilar
 ```bash
-git clone https://github.com/conclave-rz/figma-Murdoc.git
+git clone https://github.com/conclave-rz/Figma-Murdoc.git
 cd figma-Murdoc
 npm install
 npm run build:local
