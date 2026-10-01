@@ -9,28 +9,67 @@
       padding: 0;
     }
 
+    /* ===== Status + log colour tokens ===== */
+    /* Dark defaults — body[data-theme] overrides below keep light/dark correct. */
+    :root {
+      --color-connected:      #44FF88;
+      --color-connected-glow: rgba(68, 255, 136, 0.5);
+      --color-waiting:        #FFB700;
+      --color-error:          #FF455B;
+      --color-idle:           #737373;
+      --log-info:             #6cf;
+      --log-success:          #6f6;
+      --log-error:            #ff8080;
+      --log-warn:             #fc0;
+    }
+
     body {
       font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
       font-size: 11px;
       background: var(--figma-color-bg, #2c2c2c);
       color: var(--figma-color-text, rgba(255, 255, 255, 0.9));
-      height: 100%;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      padding: 6px 8px;
+      padding: 4px 12px;
       user-select: none;
     }
 
-    .bridge-status {
+    /* Visible keyboard focus for all interactive elements (WCAG 2.4.7) */
+    button:focus-visible,
+    input:focus-visible {
+      outline: 2px solid var(--figma-color-bg-brand, #0d99ff);
+      outline-offset: 1px;
+      border-radius: 3px;
+    }
+    /* Hide outline when mouse-clicking but keep it for keyboard nav */
+    button:focus:not(:focus-visible),
+    input:focus:not(:focus-visible) {
+      outline: none;
+    }
+
+    .wrap {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      width: 100%;
+    }
+
+    /* ===== Row 1 — status + CTA + icons (always visible) ===== */
+    .row-top {
       display: flex;
       align-items: center;
       gap: 6px;
-      padding: 4px 8px;
-      background: var(--figma-color-bg-secondary, #383838);
-      border: 1px solid var(--figma-color-border, #4a4a4a);
-      border-radius: 4px;
       white-space: nowrap;
+      padding-left: 4px; /* visual offset to align with Figma title bar icon */
+    }
+
+    .status-pill {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      margin-right: 3px;
+      /* Take the free space so long status sentences ellipsize gracefully
+         instead of pushing the CTA/icons off the 240px canvas. */
+      flex: 1;
+      min-width: 0;
     }
 
     .status-indicator {
@@ -38,21 +77,27 @@
       height: 8px;
       border-radius: 50%;
       flex-shrink: 0;
+      background: var(--color-idle);
     }
 
     .status-indicator.loading {
-      background: #f5a623;
+      background: var(--color-waiting);
       animation: pulse 1.5s ease-in-out infinite;
     }
 
     .status-indicator.active {
-      background: #18a957;
-      box-shadow: 0 0 6px rgba(24, 169, 87, 0.6);
-      animation: glow 2s ease-in-out infinite;
+      background: var(--color-connected);
+      box-shadow: 0 0 6px var(--color-connected-glow);
     }
 
     .status-indicator.error {
-      background: #f24822;
+      background: var(--color-error);
+    }
+
+    /* Deliberate user pause — static grey dot, NOT the pulsing loading
+       animation, so a pause never reads as "trying to connect". */
+    .status-indicator.paused {
+      background: var(--color-idle);
     }
 
     @keyframes pulse {
@@ -60,164 +105,438 @@
       50% { opacity: 1; }
     }
 
-    @keyframes glow {
-      0%, 100% { box-shadow: 0 0 4px rgba(24, 169, 87, 0.4); }
-      50% { box-shadow: 0 0 8px rgba(24, 169, 87, 0.8); }
+    #status-state {
+      font-weight: 600;
+      font-size: 10px;
+      letter-spacing: -0.2px;
+      font-stretch: 75%;
+      color: var(--figma-color-text-secondary, rgba(255, 255, 255, 0.6));
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      min-width: 0;
     }
 
-    .status-text {
-      font-weight: 500;
-      letter-spacing: 0.2px;
+    .status-indicator.active + #status-state {
+      color: var(--color-connected);
     }
 
-    .status-text .label {
-      color: var(--figma-color-text-secondary, rgba(255, 255, 255, 0.7));
+    .status-indicator.error + #status-state {
+      color: var(--color-error);
     }
 
-    .status-text .state {
+    .cta-btn {
+      background: transparent;
       color: var(--figma-color-text, rgba(255, 255, 255, 0.9));
-      margin-left: 4px;
+      border: 1px solid var(--figma-color-border, #4a4a4a);
+      border-radius: 3px;
+      font-family: inherit;
+      font-size: 10px;
+      font-weight: 500;
+      padding: 4px;
+      cursor: pointer;
+      line-height: 1.4;
     }
 
-    /* Cloud Mode toggle */
-    .cloud-section {
+    .cta-btn:disabled {
+      opacity: 0.6;
+      cursor: default;
+    }
+
+    .cta-btn:hover {
+      background: var(--figma-color-bg-secondary, #383838);
+    }
+
+    /* ===== Status meta line — connection count + proof of life ===== */
+    .status-meta {
+      display: none; /* toggled to flex from JS when there's something to show */
+      align-items: center;
+      gap: 8px;
+      padding-left: 17px; /* aligns with the pill text (4px row offset + 8px dot + 5px gap) */
+      font-size: 9px;
+      color: var(--figma-color-text-secondary, rgba(255, 255, 255, 0.5));
+      white-space: nowrap;
+    }
+
+    /* Visible recovery instruction for the ERROR state */
+    .status-error-hint {
+      display: none; /* shown from JS while in the error state */
+      padding-left: 17px;
+      font-size: 10px;
+      line-height: 1.4;
+      color: var(--color-error);
+    }
+
+    .icon-btn {
+      background: transparent;
+      border: 1px solid transparent;
+      border-radius: 3px;
+      color: var(--figma-color-text-secondary, rgba(255, 255, 255, 0.6));
+      width: 24px;
+      height: 24px;
+      padding: 0;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      font-family: inherit;
+      font-size: 14px;
+      line-height: 1;
+    }
+
+    .icon-btn:hover {
+      color: var(--figma-color-text, rgba(255, 255, 255, 0.9));
+      border-color: var(--figma-color-border, #4a4a4a);
+    }
+
+    /* Borderless icon variant — hover/active change colour only, never border.
+       Applied via .icon-btn--borderless modifier class. */
+    .icon-btn--borderless,
+    .icon-btn--borderless:hover,
+    .icon-btn--borderless.active {
+      border-color: transparent !important;
+    }
+
+    /* Expand [+] / [−] glyph is text, not SVG. Bump to match visual weight of SVG siblings. */
+    #expand-btn {
+      font-size: 18px;
+      font-weight: 400;
+      line-height: 1;
+    }
+
+    .icon-btn.active,
+    .icon-btn.active:hover {
+      color: var(--figma-color-bg-brand, #0d99ff);
+      border-color: var(--figma-color-bg-brand, #0d99ff);
+    }
+
+    .icon-btn svg {
+      width: 14px;
+      height: 14px;
+    }
+
+    /* ===== Row: cloud pairing (when cloud icon on) ===== */
+    .row {
       display: none;
       width: 100%;
     }
 
-    .cloud-section.visible {
+    .row.visible {
       display: flex;
-      flex-direction: column;
-      gap: 6px;
-      margin-top: 6px;
     }
 
-    .cloud-toggle {
-      display: flex;
-      align-items: center;
-      gap: 3px;
-      cursor: pointer;
-      font-size: 10px;
-      color: var(--figma-color-text-secondary, rgba(255, 255, 255, 0.5));
-      user-select: none;
-      margin-top: 2px;
+    .cloud-pair {
+      flex-direction: row;
+      gap: 4px;
+      align-items: stretch;
     }
 
-    .cloud-toggle:hover {
-      color: var(--figma-color-text, rgba(255, 255, 255, 0.9));
-    }
-
-    .cloud-toggle .chevron {
-      display: inline-block;
-      font-size: 8px;
-      transition: transform 0.15s ease;
-    }
-
-    .cloud-toggle.expanded .chevron {
-      transform: rotate(90deg);
-    }
-
-    .cloud-input-row input {
-      width: 100%;
+    .cloud-pair input {
+      flex: 1;
+      min-width: 0;
       background: var(--figma-color-bg, #2c2c2c);
       border: 1px solid var(--figma-color-border, #4a4a4a);
       border-radius: 3px;
       color: var(--figma-color-text, rgba(255, 255, 255, 0.9));
       font-family: monospace;
-      font-size: 12px;
-      padding: 4px 6px;
+      font-size: 11px;
+      padding: 3px 5px;
       text-transform: uppercase;
-      letter-spacing: 3px;
+      letter-spacing: 2px;
       text-align: center;
       box-sizing: border-box;
     }
 
-    .cloud-input-row input::placeholder {
+    .cloud-pair input::placeholder {
       text-transform: none;
       letter-spacing: normal;
-      font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      font-family: inherit;
       font-size: 10px;
       color: var(--figma-color-text-secondary, rgba(255, 255, 255, 0.3));
     }
 
-    .cloud-input-row button {
-      width: 100%;
+    /* Connect button only; icon-btn inside the row keeps its icon-btn styling */
+    .cloud-pair button:not(.icon-btn) {
+      flex-shrink: 0;
       background: var(--figma-color-bg-brand, #0d99ff);
       color: #fff;
       border: none;
       border-radius: 3px;
+      font-family: inherit;
       font-size: 10px;
       font-weight: 500;
-      padding: 5px 8px;
+      padding: 4px 10px;
       cursor: pointer;
     }
 
-    .cloud-input-row button:disabled {
+    .cloud-pair button:not(.icon-btn):disabled {
       opacity: 0.5;
       cursor: default;
     }
 
+    .cloud-help {
+      flex-direction: column;
+      gap: 4px;
+      padding: 6px 8px;
+      background: var(--figma-color-bg-secondary, #383838);
+      border-radius: 3px;
+      font-size: 10px;
+      line-height: 1.4;
+      color: var(--figma-color-text-secondary, rgba(255, 255, 255, 0.7));
+    }
+
+    .cloud-help p {
+      margin: 0;
+    }
+
+    body[data-theme="light"] .cloud-help {
+      background: #f0f0f0;
+      color: #555;
+    }
+
     .cloud-status {
+      display: none;
       font-size: 9px;
       color: var(--figma-color-text-secondary, rgba(255, 255, 255, 0.5));
       text-align: center;
+      padding: 2px 0;
+    }
+
+    .cloud-status:not(:empty) {
+      display: block;
     }
 
     .cloud-status.connected {
-      color: #18a957;
+      color: var(--color-connected);
     }
 
     .cloud-status.error {
-      color: #f24822;
+      color: var(--color-error);
     }
 
-    /* Light theme support */
-    @media (prefers-color-scheme: light) {
-      body {
-        background: #f5f5f5;
-        color: #333;
-      }
-      .bridge-status {
-        background: #fff;
-        border-color: #e5e5e5;
-      }
-      .status-text .label {
-        color: #666;
-      }
-      .status-text .state {
-        color: #333;
-      }
+    /* ===== Row: sub-toolbar (when [+] on) ===== */
+    .sub-toolbar {
+      align-items: center;
+      gap: 8px;
+      flex-wrap: nowrap;
+      padding-left: 4px; /* match row-top alignment with Figma title bar icon */
+    }
+
+    .sub-btn {
+      background: transparent;
+      border: none;
+      padding: 2px 0;
+      color: var(--figma-color-text-secondary, rgba(255, 255, 255, 0.6));
+      font-family: inherit;
+      font-size: 10px;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 3px;
+      white-space: nowrap;
+    }
+
+    .sub-btn:hover {
+      color: var(--figma-color-text, rgba(255, 255, 255, 0.9));
+    }
+
+    .sub-btn.active {
+      color: var(--figma-color-bg-brand, #0d99ff);
+    }
+
+    .sub-btn svg {
+      width: 11px;
+      height: 11px;
+    }
+
+    /* ===== Row: plugin update banner ===== */
+    .update-banner {
+      align-items: center;
+      gap: 6px;
+      padding: 4px 6px;
+      background: var(--figma-color-bg-secondary, #383838);
+      border: 1px solid var(--figma-color-border, #4a4a4a);
+      border-radius: 3px;
+      font-size: 10px;
+      line-height: 1.4;
+      color: var(--figma-color-text, rgba(255, 255, 255, 0.9));
+    }
+
+    .update-banner span {
+      flex: 1;
+      min-width: 0;
+    }
+
+    /* ===== Row: log panel ===== */
+    .log-panel {
+      flex-direction: column;
+      gap: 0;
+      border: 1px solid var(--figma-color-border, #4a4a4a);
+      border-radius: 3px;
+      overflow: hidden;
+      background: var(--figma-color-bg, #1e1e1e);
+    }
+
+    .log-entries {
+      max-height: 160px;
+      overflow-y: auto;
+      padding: 4px 6px;
+      font-family: 'SF Mono', 'Menlo', Consolas, monospace;
+      font-size: 10px;
+      line-height: 1.4;
+    }
+
+    .log-entry {
+      display: flex;
+      align-items: baseline;
+      gap: 5px;
+      color: var(--figma-color-text, rgba(255, 255, 255, 0.8));
+      line-height: 1.5;
+    }
+    .log-ts {
+      flex-shrink: 0;
+      opacity: 0.45;
+      font-size: 9px;
+      user-select: none;
+    }
+    .log-msg {
+      flex: 1;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .log-dur {
+      display: none;
+    }
+    .log-count {
+      flex-shrink: 0;
+      opacity: 0.5;
+      font-size: 9px;
+      min-width: 18px;
+      text-align: right;
+    }
+
+    .log-entry.info   { color: var(--log-info); }
+    .log-entry.success{ color: var(--log-success); }
+    .log-entry.error  { color: var(--log-error); }
+    .log-entry.warn   { color: var(--log-warn); }
+
+    /* ===== Light theme ===== */
+    /* Theme manual override redefines the Figma-injected vars so all token
+       consumers cascade automatically. When no data-theme attribute is set,
+       Figma's themeColors:true (in code.js) controls the values natively. */
+    body[data-theme="light"] {
+      --figma-color-bg:            #ffffff;
+      --figma-color-bg-secondary:  #f5f5f5;
+      --figma-color-border:        #e5e5e5;
+      --figma-color-text:          #333333;
+      --figma-color-text-secondary: #777777;
+      --color-connected:      #16a34a;
+      --color-connected-glow: rgba(22, 163, 74, 0.45);
+      --color-waiting:        #d97706;
+      --color-error:          #ef4444;
+      --color-idle:           #6b7280;
+      --log-info:             #00639e;
+      --log-success:          #167016;
+      --log-error:            #b81e2c;
+      --log-warn:             #7a5c00;
+    }
+    body[data-theme="dark"] {
+      --figma-color-bg:            #2c2c2c;
+      --figma-color-bg-secondary:  #383838;
+      --figma-color-border:        #4a4a4a;
+      --figma-color-text:          rgba(255, 255, 255, 0.9);
+      --figma-color-text-secondary: rgba(255, 255, 255, 0.55);
+      --color-connected:      #44FF88;
+      --color-connected-glow: rgba(68, 255, 136, 0.5);
+      --color-waiting:        #FFB700;
+      --color-error:          #FF455B;
+      --color-idle:           #737373;
+      --log-info:             #6cf;
+      --log-success:          #6f6;
+      --log-error:            #ff8080;
+      --log-warn:             #fc0;
     }
   </style>
 </head>
 <body>
-  <div style="display: flex; flex-direction: column; align-items: center; width: 100%;">
-    <div class="bridge-status" id="status-container">
-      <div class="status-indicator loading" id="status-dot"></div>
-      <div class="status-text">
-        <span class="label">MCP</span>
-        <span class="state" id="status-state">connecting</span>
+  <div class="wrap">
+    <!-- Row 1 — always visible -->
+    <div class="row-top">
+      <div class="status-pill">
+        <div class="status-indicator loading" id="status-dot" aria-hidden="true"></div>
+        <span id="status-state" role="status" aria-live="polite">Looking for your AI app…</span>
       </div>
+      <!-- CTA starts hidden; the first state reconcile shows it with an honest label -->
+      <button class="cta-btn" id="cta-btn" onclick="toggleLocalConnection()" style="display:none">Pause</button>
+      <button class="icon-btn" id="cloud-icon" onclick="toggleCloudPair()" title="Cloud pairing" aria-label="Cloud pairing" aria-expanded="false">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
+          <path d="M18 10h-1.26A8 8 0 1 0 9 20h9a5 5 0 0 0 0-10z"/>
+        </svg>
+      </button>
+      <button class="icon-btn" id="expand-btn" onclick="toggleSubToolbar()" title="Show options" aria-label="Show options" aria-expanded="false">+</button>
     </div>
 
-    <div class="cloud-toggle" id="cloud-toggle" onclick="toggleCloudSection()">
-      <span class="chevron">▶</span> Cloud Mode
+    <!-- Status meta — connection count + proof of life (shown when connected) -->
+    <div class="status-meta" id="status-meta">
+      <span id="status-conn-count"></span>
+      <span id="status-last-action"></span>
     </div>
 
-    <div class="cloud-section" id="cloud-section">
-      <div class="cloud-input-row">
-        <input type="text" id="cloud-code" maxlength="6" placeholder="Pairing code" autocomplete="off" />
-      </div>
-      <div class="cloud-input-row">
-        <button id="cloud-btn" onclick="cloudConnect()">Connect</button>
-      </div>
-      <div class="cloud-status" id="cloud-status"></div>
+    <!-- Visible recovery instruction, shown only in the error state -->
+    <div class="status-error-hint" id="status-error-hint">Close this window and reopen the plugin.</div>
+
+    <!-- Plugin update banner (shown when the server reports a newer plugin) -->
+    <div class="row update-banner" id="update-banner">
+      <span>Plugin update available — re-import it in Figma (Plugins → Development → Import from manifest).</span>
+      <button class="icon-btn icon-btn--borderless" onclick="dismissUpdateBanner()" title="Dismiss" aria-label="Dismiss update notice">×</button>
+    </div>
+
+    <!-- Cloud pairing (shown when cloud icon active) -->
+    <div class="row cloud-pair" id="cloud-pair">
+      <button class="icon-btn icon-btn--borderless cloud-info-btn" id="cloud-info-btn" onclick="toggleCloudHelp()" title="About pairing codes" aria-label="About pairing codes" aria-expanded="false" aria-controls="cloud-help">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
+          <circle cx="12" cy="12" r="10"/>
+          <line x1="12" y1="16" x2="12" y2="12"/>
+          <line x1="12" y1="8" x2="12.01" y2="8"/>
+        </svg>
+      </button>
+      <input type="text" id="cloud-code" maxlength="6" placeholder="Pairing code" autocomplete="off" aria-label="Cloud pairing code" />
+      <button id="cloud-btn" onclick="cloudConnect()">Connect</button>
+    </div>
+    <div class="row cloud-help" id="cloud-help" role="region" aria-label="About pairing codes">
+      <p>Use this when Claude is on a different device from Figma.</p>
+      <p>Generate a 6-char code in Claude and paste it here.</p>
+    </div>
+    <div class="cloud-status" id="cloud-status"></div>
+
+    <!-- Sub-toolbar (shown when [+] active) -->
+    <div class="row sub-toolbar" id="sub-toolbar">
+      <button class="sub-btn" id="log-toggle" onclick="toggleLog()" aria-expanded="false" aria-controls="log-panel">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
+          <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>
+          <circle cx="12" cy="12" r="3"/>
+        </svg>
+        Activity
+      </button>
+      <button class="icon-btn" id="copy-log-btn" onclick="copyLogToClipboard()" title="Copy activity to clipboard" aria-label="Copy activity to clipboard" style="display:none">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
+          <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
+          <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+        </svg>
+      </button>
+    </div>
+
+    <!-- Activity panel (shown when Activity active) -->
+    <div class="row log-panel" id="log-panel">
+      <div class="log-entries" id="log-entries"></div>
     </div>
   </div>
 
   <script>
     // ============================================================================
-    // GLOBAL STATE - Data storage for Puppeteer/MCP access
+    // GLOBAL STATE — backing store for the in-iframe WebSocket bridge client
     // ============================================================================
     window.__figmaVariablesData = null;
     window.__figmaVariablesReady = false;
@@ -227,13 +546,98 @@
 
     let requestIdCounter = 0;
 
-    // UI update helper
-    function updateStatus(state, isActive, isError) {
-      const dot = document.getElementById('status-dot');
-      const stateText = document.getElementById('status-state');
+    // Status inputs owned by the message handler at the bottom of this file.
+    // bridgeError flips true on a code.js ERROR message; a later successful
+    // VARIABLES_DATA clears it (the plugin recovered).
+    var bridgeError = false;
 
-      dot.className = 'status-indicator ' + (isError ? 'error' : (isActive ? 'active' : 'loading'));
-      stateText.textContent = state;
+    // Single source of truth for the status pill. Derives the rendered state
+    // from actual facts instead of trusting one-off events:
+    //   - live WS connections (local + cloud) from the connection pool
+    //   - userPaused (pool exposes __wsIsPaused)
+    //   - scanning/discovery activity (__wsIsScanning / __wsIsDiscoveryActive)
+    //   - bridgeError (ERROR message from code.js)
+    // window.__figmaVariablesReady is also an input (set by VARIABLES_DATA);
+    // it no longer drives the pill green on its own — a Figma-side data event
+    // says nothing about whether an AI app is actually connected.
+    function deriveAndRenderStatus() {
+      var dot = document.getElementById('status-dot');
+      var stateText = document.getElementById('status-state');
+      if (!dot || !stateText) return;
+
+      var conns = (typeof window.__wsGetActiveConnections === 'function') ? (window.__wsGetActiveConnections() || []) : [];
+      var live = 0;
+      for (var i = 0; i < conns.length; i++) {
+        if (conns[i] && conns[i].ws && conns[i].ws.readyState === 1) live++;
+      }
+      var paused = (typeof window.__wsIsPaused === 'function') ? window.__wsIsPaused() : false;
+      var scanning = (typeof window.__wsIsScanning === 'function' && window.__wsIsScanning()) ||
+                     (typeof window.__wsIsDiscoveryActive === 'function' && window.__wsIsDiscoveryActive());
+
+      var dotClass, text;
+      if (bridgeError) {
+        dotClass = 'error';
+        text = 'Something broke';
+      } else if (paused) {
+        dotClass = 'paused';
+        text = 'Paused — AI can\'t make changes';
+      } else if (live >= 1) {
+        dotClass = 'active';
+        text = 'Connected — AI can work in this file';
+      } else if (scanning) {
+        dotClass = 'loading';
+        text = 'Looking for your AI app…';
+      } else {
+        // Defensive fallback: discovery is always on unless paused, so this
+        // only renders if the discovery loop is somehow disabled.
+        dotClass = '';
+        text = 'Not connected';
+      }
+      dot.className = 'status-indicator' + (dotClass ? ' ' + dotClass : '');
+      stateText.textContent = text;
+      stateText.title = text; // full sentence survives ellipsis truncation
+
+      var hint = document.getElementById('status-error-hint');
+      if (hint) hint.style.display = bridgeError ? 'block' : 'none';
+
+      renderStatusMeta(live);
+    }
+
+    // Small always-visible line under the pill: "Connected to N AI app(s)"
+    // plus proof of life ("Last action: Xs ago"). Hidden entirely when there
+    // is nothing to show (zero connections).
+    function renderStatusMeta(liveCount) {
+      var meta = document.getElementById('status-meta');
+      var countEl = document.getElementById('status-conn-count');
+      var lastEl = document.getElementById('status-last-action');
+      if (!meta || !countEl || !lastEl) return;
+      var anything = false;
+      if (liveCount >= 1) {
+        countEl.textContent = 'Connected to ' + liveCount + ' AI app' + (liveCount === 1 ? '' : 's');
+        countEl.style.display = '';
+        anything = true;
+      } else {
+        countEl.textContent = '';
+        countEl.style.display = 'none';
+      }
+      if (liveCount >= 1 && _lastActionAt) {
+        lastEl.textContent = 'Last action: ' + formatAgo(Date.now() - _lastActionAt);
+        lastEl.style.display = '';
+        anything = true;
+      } else {
+        lastEl.textContent = '';
+        lastEl.style.display = 'none';
+      }
+      meta.style.display = anything ? 'flex' : 'none';
+    }
+
+    function formatAgo(ms) {
+      var s = Math.max(0, Math.floor(ms / 1000));
+      if (s < 60) return s + 's ago';
+      var m = Math.floor(s / 60);
+      if (m < 60) return m + 'm ago';
+      var h = Math.floor(m / 60);
+      return h + 'h ago';
     }
 
     // ============================================================================
@@ -385,14 +789,39 @@
       }).catch(function(err) { return { success: false, error: err.message || String(err) }; });
     };
 
-    // Add a component property (BOOLEAN, TEXT, INSTANCE_SWAP, VARIANT)
+    // Add a component property (BOOLEAN, TEXT, INSTANCE_SWAP, VARIANT, SLOT)
     // Note: We use 'propertyType' instead of 'type' to avoid collision with message type field
     window.addComponentProperty = (nodeId, propertyName, type, defaultValue, options) => {
       var params = { nodeId: nodeId, propertyName: propertyName, propertyType: type, defaultValue: defaultValue };
       if (options) {
         if (options.preferredValues) params.preferredValues = options.preferredValues;
+        if (options.description) params.description = options.description;
       }
       return window.sendPluginCommand('ADD_COMPONENT_PROPERTY', params)
+        .catch(function(err) { return { success: false, error: err.message || String(err) }; });
+    };
+
+    // ============================================================================
+    // SLOT OPERATIONS
+    // ============================================================================
+
+    window.createSlot = (nodeId, options) => {
+      return window.sendPluginCommand('CREATE_SLOT', Object.assign({ nodeId: nodeId }, options || {}))
+        .catch(function(err) { return { success: false, error: err.message || String(err) }; });
+    };
+
+    window.getSlots = (nodeId) => {
+      return window.sendPluginCommand('GET_SLOTS', { nodeId: nodeId })
+        .catch(function(err) { return { success: false, error: err.message || String(err) }; });
+    };
+
+    window.appendToSlot = (params) => {
+      return window.sendPluginCommand('APPEND_TO_SLOT', params)
+        .catch(function(err) { return { success: false, error: err.message || String(err) }; });
+    };
+
+    window.resetSlot = (params) => {
+      return window.sendPluginCommand('RESET_SLOT', params)
         .catch(function(err) { return { success: false, error: err.message || String(err) }; });
     };
 
@@ -484,6 +913,7 @@
         if (options.fontSize) params.fontSize = options.fontSize;
         if (options.fontWeight) params.fontWeight = options.fontWeight;
         if (options.fontFamily) params.fontFamily = options.fontFamily;
+        if (options.fontStyle) params.fontStyle = options.fontStyle;
       }
       return window.sendPluginCommand('SET_TEXT_CONTENT', params)
         .catch(function(err) { return { success: false, error: err.message || String(err) }; });
@@ -552,6 +982,15 @@
         .catch(function(err) { return { success: false, error: err.message || String(err) }; });
     };
 
+    // Audit component accessibility (deep a11y scorecard with color-blind simulation)
+    window.auditComponentAccessibility = function(nodeId, targetSize) {
+      var params = {};
+      if (nodeId) params.nodeId = nodeId;
+      if (targetSize !== undefined) params.targetSize = targetSize;
+      return window.sendPluginCommand('AUDIT_COMPONENT_ACCESSIBILITY', params, 120000)
+        .catch(function(err) { return { success: false, error: err.message || String(err) }; });
+    };
+
     // Analyze component set (variant state machine + cross-variant diff)
     window.analyzeComponentSet = (nodeId) => {
       return window.sendPluginCommand('ANALYZE_COMPONENT_SET', {
@@ -596,7 +1035,8 @@
     };
 
     // ============================================================================
-    // WEBSOCKET BRIDGE CLIENT - Fallback transport when CDP is unavailable
+    // WEBSOCKET BRIDGE CLIENT — primary transport from the plugin sandbox to
+    // the MCP server. Scans port range 9223–9232 for multiple instances.
     // ============================================================================
     (function() {
       // Port range for multi-instance support (matches server's port-discovery.ts)
@@ -605,11 +1045,7 @@
 
       // Multi-connection state: plugin connects to ALL active MCP servers
       // so that every Claude tab/CLI instance gets Figma access.
-      var activeConnections = []; // Array of { port, ws }
-      var wsReconnectDelay = 500;
-      var wsMaxReconnectDelay = 5000;
-      var wsReconnectAttempts = 0;
-      var wsMaxReconnectAttempts = 50;
+      var activeConnections = []; // Array of { port, ws, serverVersion?, serverInfo? }
       var isScanning = false;
 
       // Backward-compat: ws and wsConnected reflect "at least one connection"
@@ -632,11 +1068,37 @@
         'CREATE_VARIABLE_COLLECTION': function(params) { return window.createVariableCollection(params.name, params); },
         'GET_LOCAL_COMPONENTS': function() { return window.getLocalComponents(); },
         'INSTANTIATE_COMPONENT': function(params) { return window.instantiateComponent(params.componentKey, params); },
+        // Component set creation — forward params wholesale; result payload rides in msg.data.
+        // Timeout scales with variant count (the plugin builds all variants in one
+        // uncancellable pass; a fixed 30s ceiling made big matrices report failure
+        // while the set still got created). Mirrors componentSetTimeoutMs in
+        // websocket-connector.ts, which adds a 5s buffer on the server hop so this
+        // hop's result always arrives first — keep the base formula in sync.
+        'CREATE_COMPONENT_SET': function(params) {
+          var variantCount = 1;
+          if (params && params.componentIds && params.componentIds.length) {
+            variantCount = params.componentIds.length;
+          } else if (params && params.properties) {
+            for (var axis in params.properties) {
+              if (params.properties.hasOwnProperty(axis)) {
+                var vals = params.properties[axis];
+                variantCount *= Math.max(1, (vals && vals.length) || 1);
+              }
+            }
+          }
+          var timeout = Math.min(120000, Math.max(30000, variantCount * 1200));
+          return window.sendPluginCommand('CREATE_COMPONENT_SET', params, timeout)
+            .catch(function(err) { return { success: false, error: err.message || String(err) }; });
+        },
         'GET_COMPONENT': function(params) { return window.requestComponentData(params.nodeId); },
         'SET_NODE_DESCRIPTION': function(params) { return window.setNodeDescription(params.nodeId, params.description, params.descriptionMarkdown); },
         'ADD_COMPONENT_PROPERTY': function(params) { return window.addComponentProperty(params.nodeId, params.propertyName, params.propertyType, params.defaultValue, params); },
         'EDIT_COMPONENT_PROPERTY': function(params) { return window.editComponentProperty(params.nodeId, params.propertyName, params.newValue); },
         'DELETE_COMPONENT_PROPERTY': function(params) { return window.deleteComponentProperty(params.nodeId, params.propertyName); },
+        'CREATE_SLOT': function(params) { return window.createSlot(params.nodeId, params); },
+        'GET_SLOTS': function(params) { return window.getSlots(params.nodeId); },
+        'APPEND_TO_SLOT': function(params) { return window.appendToSlot(params); },
+        'RESET_SLOT': function(params) { return window.resetSlot(params); },
         'RESIZE_NODE': function(params) { return window.resizeNode(params.nodeId, params.width, params.height, params.withConstraints); },
         'MOVE_NODE': function(params) { return window.moveNode(params.nodeId, params.x, params.y); },
         'SET_NODE_FILLS': function(params) { return window.setNodeFills(params.nodeId, params.fills); },
@@ -652,6 +1114,7 @@
         'SET_IMAGE_FILL': function(params) { return window.setImageFill(params.nodeIds || params.nodeId, params.imageData, params.scaleMode); },
         'SET_INSTANCE_PROPERTIES': function(params) { return window.setInstanceProperties(params.nodeId, params.properties); },
         'LINT_DESIGN': function(params) { return window.lintDesign(params.nodeId, params.rules, params.maxDepth, params.maxFindings); },
+        'AUDIT_COMPONENT_ACCESSIBILITY': function(params) { return window.auditComponentAccessibility(params.nodeId, params.targetSize); },
         'GET_VARIABLES_DATA': function() {
           // Return the cached variables data directly
           if (window.__figmaVariablesReady && window.__figmaVariablesData) {
@@ -674,6 +1137,9 @@
         },
         'CREATE_SHAPE_WITH_TEXT': function(params) {
           return window.sendPluginCommand('CREATE_SHAPE_WITH_TEXT', params);
+        },
+        'CREATE_SECTION': function(params) {
+          return window.sendPluginCommand('CREATE_SECTION', params);
         },
         'CREATE_TABLE': function(params) {
           return window.sendPluginCommand('CREATE_TABLE', params, 30000);
@@ -727,6 +1193,12 @@
         'SKIP_SLIDE': function(params) {
           return window.sendPluginCommand('SKIP_SLIDE', params, 5000);
         },
+        'GET_TEXT_STYLES': function(params) {
+          return window.sendPluginCommand('GET_TEXT_STYLES', params, 5000);
+        },
+        'SET_SLIDE_BACKGROUND': function(params) {
+          return window.sendPluginCommand('SET_SLIDE_BACKGROUND', params, 5000);
+        },
         'ADD_TEXT_TO_SLIDE': function(params) {
           return window.sendPluginCommand('ADD_TEXT_TO_SLIDE', params, 10000);
         },
@@ -778,10 +1250,15 @@
       function removeConnection(port) {
         activeConnections = activeConnections.filter(function(c) { return c.port !== port; });
         updateCompatState();
+        // Re-pace the health discovery loop: dropping to zero connections
+        // switches it to the fast (3s) cadence immediately.
+        scheduleDiscovery();
       }
 
       /**
-       * Update backward-compat variables (ws, wsPort, wsConnected).
+       * Update backward-compat variables (ws, wsPort, wsConnected) and
+       * re-render the status pill so the Local/Cloud mode suffix reflects
+       * the new connection set.
        */
       function updateCompatState() {
         var live = activeConnections.filter(function(c) { return c.ws.readyState === 1; });
@@ -793,6 +1270,9 @@
           ws = null;
           wsPort = null;
         }
+        // deriveAndRenderStatus is defined in the outer scope (same script tag,
+        // hoisted). Guarded for the unlikely case it's invoked before then.
+        if (typeof deriveAndRenderStatus === 'function') deriveAndRenderStatus();
       }
 
       /**
@@ -827,6 +1307,9 @@
       // After connecting, disconnect-triggered retries have their own limit.
       var initialScanAttempts = 0;
       var MAX_INITIAL_SCANS = 3;
+      // Set true only when the user clicks Pause. Suppresses the health
+      // discovery loop so a deliberate pause is not undone automatically.
+      var userPaused = false;
 
       function wsScanAndConnect() {
         if (isScanning) return;
@@ -863,8 +1346,6 @@
               pending--;
               if (pending <= 0) {
                 isScanning = false;
-                wsReconnectDelay = 500;
-                wsReconnectAttempts = 0;
               }
             };
 
@@ -879,13 +1360,21 @@
                 isScanning = false;
                 // Retry with backoff if no servers found, up to MAX_INITIAL_SCANS
                 if (!foundAny && activeConnections.length === 0) {
-                  initialScanAttempts++;
+                  // Fast burst on load: a couple of quick retries with backoff.
+                  // Once the burst exhausts we STOP re-arming here — the HTTP
+                  // /health discovery loop takes over and keeps probing quietly
+                  // (fetch to a closed port rejects catchably, no console spam),
+                  // so a server that starts AFTER the plugin still connects
+                  // without a restart.
                   if (initialScanAttempts < MAX_INITIAL_SCANS) {
-                    var delay = 3000 * initialScanAttempts; // 3s, 6s
-                    console.log('[MCP Bridge] No servers found, retry ' + initialScanAttempts + '/' + MAX_INITIAL_SCANS + ' in ' + (delay/1000) + 's');
-                    setTimeout(wsScanAndConnect, delay);
-                  } else {
-                    console.log('[MCP Bridge] No MCP servers found after ' + MAX_INITIAL_SCANS + ' scans. Restart plugin to retry.');
+                    initialScanAttempts++;
+                    if (initialScanAttempts < MAX_INITIAL_SCANS) {
+                      var delay = 3000 * initialScanAttempts; // 3s, 6s
+                      console.log('[MCP Bridge] No servers found, retry ' + initialScanAttempts + '/' + MAX_INITIAL_SCANS + ' in ' + (delay/1000) + 's');
+                      setTimeout(wsScanAndConnect, delay);
+                    } else {
+                      console.log('[MCP Bridge] No MCP server yet — health discovery keeps probing every ' + (DISCOVERY_IDLE_MS/1000) + 's until one appears (no restart needed).');
+                    }
                   }
                 }
               }
@@ -898,10 +1387,18 @@
 
       /**
        * Reconnect a specific port that disconnected.
-       * Tries the same port first (server may have just restarted),
-       * then does a full rescan to pick up any new servers.
+       * Tries the same port once (server may have just restarted); anything
+       * slower is picked up by the /health discovery loop.
        */
       function wsReconnectPort(port) {
+        if (port === 'cloud') {
+          // The cloud connection is a wss:// relay, not a localhost port —
+          // 'ws://localhost:cloud' is an invalid URL. Re-dial through the
+          // cloud code (correct URL + its own bounded retry/give-up).
+          if (typeof window.__cloudReconnect === 'function') window.__cloudReconnect();
+          return;
+        }
+        if (userPaused || isPortConnected(port)) return;
         try {
           var testWs = new WebSocket('ws://localhost:' + port);
           var timeout = setTimeout(function() {
@@ -921,7 +1418,39 @@
             clearTimeout(timeout);
           };
         } catch (e) {
-          // Port gone — no further scanning to avoid console spam
+          // Port gone — the discovery loop will find it if it comes back
+        }
+      }
+
+      /**
+       * Connect directly to a port the /health probe just verified is OUR
+       * server. Same attach path as the scan, plus the server version the
+       * probe reported (stored on the connection for display/diagnostics).
+       */
+      function wsConnectToPort(port, serverVersion) {
+        if (userPaused || isPortConnected(port)) return;
+        try {
+          var testWs = new WebSocket('ws://localhost:' + port);
+          var timeout = setTimeout(function() {
+            if (testWs.readyState !== 1) testWs.close();
+          }, 3000);
+
+          testWs.onopen = function() {
+            clearTimeout(timeout);
+            var conn = { port: port, ws: testWs };
+            if (serverVersion) conn.serverVersion = serverVersion;
+            activeConnections.push(conn);
+            updateCompatState();
+            console.log('[MCP Bridge] WebSocket connected to port ' + port + (serverVersion ? ' (server v' + serverVersion + ')' : '') + ' (' + activeConnections.length + ' server(s) total)');
+            attachWsHandlers(testWs, port);
+            initializeConnection(testWs, port);
+          };
+
+          testWs.onerror = function() {
+            clearTimeout(timeout);
+          };
+        } catch (e) {
+          // ignore — next discovery pass will retry
         }
       }
 
@@ -937,7 +1466,16 @@
             if (message.type === 'SERVER_HELLO' && message.data) {
               console.log('[MCP Bridge] Connected to server on port ' + message.data.port + ' (PID: ' + message.data.pid + ', v' + message.data.serverVersion + ')');
               var conn = activeConnections.find(function(c) { return c.ws === activeWs; });
-              if (conn) conn.serverInfo = message.data;
+              if (conn) {
+                conn.serverInfo = message.data;
+                if (message.data.serverVersion) conn.serverVersion = message.data.serverVersion;
+              }
+              return;
+            }
+
+            // Server says the installed plugin is older than it expects.
+            if (message.type === 'PLUGIN_UPDATE_AVAILABLE') {
+              if (typeof showUpdateBanner === 'function') showUpdateBanner();
               return;
             }
 
@@ -978,17 +1516,17 @@
             event.reason === 'Replaced by new connection' ||
             event.reason === 'Replaced by same file reconnection'
           ));
-          if (wasReplaced) {
-            console.log('[MCP Bridge] WebSocket:' + port + ': replaced by newer connection, stopping reconnect');
+          // If user paused via the Pause button, also stop auto-reconnect.
+          var wasManualPause = (event.code === 1000 && event.reason === 'Manual disconnect');
+          if (wasReplaced || wasManualPause) {
+            console.log('[MCP Bridge] WebSocket:' + port + ': stopped by ' + (wasManualPause ? 'user pause' : 'replacement'));
             return;
           }
 
-          // Retry the specific port with limited attempts (no full rescan)
-          wsReconnectAttempts++;
-          if (wsReconnectAttempts <= 5) {
-            var delay = Math.min(1000 * wsReconnectAttempts, 5000);
-            setTimeout(function() { wsReconnectPort(port); }, delay);
-          }
+          // One immediate same-port retry covers fast same-port server
+          // restarts; anything slower is picked up by the /health discovery
+          // loop, so the old capped retry-with-backoff dance is gone.
+          setTimeout(function() { wsReconnectPort(port); }, 1000);
         };
 
         activeWs.onerror = function() {
@@ -1021,6 +1559,14 @@
       window.__wsForwardDocumentChange = function(data) {
         if (wsConnected) {
           broadcastToAll({ type: 'DOCUMENT_CHANGE', data: data });
+        }
+      };
+
+      // v1.25.0: forward METADATA_CHANGE events (description/annotation edits)
+      // so figma_diff_versions can surface them despite Figma REST not exposing them.
+      window.__wsForwardMetadataChange = function(data) {
+        if (wsConnected) {
+          broadcastToAll({ type: 'METADATA_CHANGE', data: data });
         }
       };
 
@@ -1063,10 +1609,118 @@
 
       window.__wsGetActiveConnections = function() { return activeConnections; };
 
-      // Single scan on load — no periodic rescanning to avoid console spam.
-      // If no server found, retries up to MAX_INITIAL_SCANS times then stops.
-      // On disconnect, retries the specific port up to 5 times then stops.
+      window.__wsDisconnectAll = function() {
+        for (var i = 0; i < activeConnections.length; i++) {
+          try { activeConnections[i].ws.close(1000, 'Manual disconnect'); } catch (e) {}
+        }
+        activeConnections = [];
+        ws = null;
+        wsConnected = false;
+        // Reset scan state so a future Resume gets a clean retry budget.
+        isScanning = false;
+        initialScanAttempts = 0;
+        // Deliberate user pause — keep discovery quiet until Resume.
+        userPaused = true;
+      };
+
+      window.__wsScanAndConnect = wsScanAndConnect;
+
+      // Manual (re)connect from the UI: clear any pause, refresh the retry budget
+      // so the user gets the responsive fast burst again, then scan.
+      window.__wsManualScan = function() {
+        userPaused = false;
+        initialScanAttempts = 0;
+        wsScanAndConnect();
+      };
+
+      window.__wsIsPaused = function() { return userPaused; };
+      window.__wsIsScanning = function() { return isScanning; };
+      // The health discovery loop is armed whenever the user hasn't paused —
+      // used by the status pill to show "Looking for your AI app…" honestly.
+      window.__wsIsDiscoveryActive = function() { return !userPaused; };
+
+      // ======================================================================
+      // HTTP /health DISCOVERY LOOP — replaces the old zero-connection-gated
+      // WS watchdog. fetch() to a closed port rejects catchably with NO
+      // console spam (unlike new WebSocket()), so this can run always-on:
+      //   - every 3s while zero connections (fast attach after server start)
+      //   - every 10s while connected (catches a restarted instance among
+      //     live ones — previously a permanent dead end)
+      // A port only gets a WS dial after its /health response matches OUR
+      // server's payload shape ({status:'ok', version, clients, ...}).
+      // ======================================================================
+      var HEALTH_TIMEOUT_MS = 1500;
+      var DISCOVERY_IDLE_MS = 3000;    // cadence with zero connections
+      var DISCOVERY_STEADY_MS = 10000; // cadence with >=1 connection
+      var discoveryTimer = null;
+      var discoveryInFlight = false;
+
+      function liveConnectionCount() {
+        var n = 0;
+        for (var i = 0; i < activeConnections.length; i++) {
+          if (activeConnections[i].ws.readyState === 1) n++;
+        }
+        return n;
+      }
+
+      function isOurHealthPayload(json) {
+        // Shape served by websocket-server.ts handleHttpRequest()
+        return !!(json && json.status === 'ok' && typeof json.version === 'string' && json.clients !== undefined);
+      }
+
+      function probePortHealth(port) {
+        var opts = {};
+        try {
+          if (typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function') {
+            opts.signal = AbortSignal.timeout(HEALTH_TIMEOUT_MS);
+          }
+        } catch (e) { /* AbortSignal unavailable — fetch just runs untimed */ }
+        return fetch('http://localhost:' + port + '/health', opts)
+          .then(function(res) {
+            if (!res.ok) return null;
+            return res.json().then(function(json) {
+              return isOurHealthPayload(json) ? { port: port, version: json.version } : null;
+            });
+          })
+          .catch(function() { return null; }); // closed port / timeout / non-JSON — all quiet
+      }
+
+      function scheduleDiscovery() {
+        if (discoveryTimer) clearTimeout(discoveryTimer);
+        var delay = liveConnectionCount() > 0 ? DISCOVERY_STEADY_MS : DISCOVERY_IDLE_MS;
+        discoveryTimer = setTimeout(runDiscoveryPass, delay);
+      }
+
+      function runDiscoveryPass() {
+        if (discoveryInFlight) { scheduleDiscovery(); return; }
+        if (userPaused) { scheduleDiscovery(); return; } // never auto-connect while paused
+        var candidates = [];
+        for (var p = WS_PORT_RANGE_START; p <= WS_PORT_RANGE_END; p++) {
+          if (!isPortConnected(p)) candidates.push(p);
+        }
+        if (candidates.length === 0) { scheduleDiscovery(); return; }
+        discoveryInFlight = true;
+        Promise.all(candidates.map(probePortHealth))
+          .then(function(results) {
+            for (var i = 0; i < results.length; i++) {
+              var hit = results[i];
+              if (hit && !userPaused && !isPortConnected(hit.port)) {
+                wsConnectToPort(hit.port, hit.version);
+              }
+            }
+          })
+          .catch(function() { /* individual probes already swallow errors */ })
+          .then(function() {
+            discoveryInFlight = false;
+            scheduleDiscovery();
+          });
+      }
+
+      // Initial scan on load (fast WS burst for instant attach). The discovery
+      // loop then keeps probing forever: fast while disconnected, slow while
+      // connected. Disconnect-triggered same-port retries handle quick drops.
       wsScanAndConnect();
+      scheduleDiscovery();
     })();
 
     // ============================================================================
@@ -1074,26 +1728,551 @@
     // ============================================================================
     var cloudWs = null;
     var CLOUD_RELAY_HOST = 'wss://figma-console-mcp.southleft.com';
+    var _lastCloudCode = null;              // most recent code that successfully paired
+    var _cloudUserDisconnected = false;     // user clicked Disconnect — suppress auto re-dial
+    var _cloudWasConnectedBeforePause = false; // restore cloud on Resume after Pause
+    var _cloudRetryCount = 0;               // bounded auto-reconnect budget
+    var CLOUD_MAX_RETRIES = 5;
+    var _cloudEverConnected = false;        // paired successfully THIS session — separates a real
+                                            // drop (worth telling the user) from a stale restored
+                                            // code that never connected (stay quiet)
 
-    function toggleCloudSection() {
-      var section = document.getElementById('cloud-section');
-      var toggle = document.getElementById('cloud-toggle');
-      var isExpanding = !section.classList.contains('visible');
-      section.classList.toggle('visible');
-      toggle.classList.toggle('expanded');
+    // ============================================================================
+    // 3-STAGE UI TOGGLES
+    // Stage 1: row-top (always visible)
+    // Stage 2: sub-toolbar (revealed by [+])
+    // Stage 3: log panel (revealed by Show log)
+    // Cloud pairing is an independent row triggered by the cloud icon.
+    // ============================================================================
 
-      // Resize plugin window to fit content
-      var height = isExpanding ? 130 : 50;
-      parent.postMessage({ pluginMessage: { type: 'RESIZE_UI', width: 140, height: height } }, '*');
+    // Fixed 240px width matches Figma right-side nav min.
+    // Height grows freely with content. If the plugin extends past Figma's
+    // visible UI, the user drags the plugin window to reveal what's clipped.
+    var PLUGIN_WIDTH = 240;
+
+    function sendResize() {
+      // Force a layout pass so measurements reflect the current visible rows.
+      void document.body.offsetHeight;
+      // Measure the inner content element + body padding. Avoids stale
+      // scrollHeight values when the iframe was previously larger.
+      var wrap = document.querySelector('.wrap');
+      if (!wrap) return;
+      var bs = window.getComputedStyle(document.body);
+      var h = wrap.offsetHeight
+            + (parseFloat(bs.paddingTop) || 0)
+            + (parseFloat(bs.paddingBottom) || 0);
+      parent.postMessage({
+        pluginMessage: { type: 'RESIZE_UI', width: PLUGIN_WIDTH, height: Math.ceil(h) }
+      }, '*');
+    }
+
+    function autoResize() {
+      sendResize(); // immediate — fires before next paint so Figma can grow upward in the same frame
+      requestAnimationFrame(function() {
+        sendResize();
+        setTimeout(sendResize, 150);
+      });
+    }
+
+    // Observe the wrap (actual content), not body, so size changes from any
+    // row toggle fire a resize whether the rows grew or shrank.
+    if (typeof ResizeObserver !== 'undefined') {
+      var _wrapObserve = function() {
+        var wrap = document.querySelector('.wrap');
+        if (wrap) { var ro = new ResizeObserver(sendResize); ro.observe(wrap); }
+      };
+      _wrapObserve();
+    }
+
+    // Initial tighten — multiple attempts at different times to defeat any
+    // residual Figma-side iframe sizing from a previous plugin state.
+    sendResize();
+    requestAnimationFrame(sendResize);
+    window.addEventListener('load', function() {
+      sendResize();
+      setTimeout(sendResize, 50);
+      setTimeout(sendResize, 200);
+      setTimeout(sendResize, 600);
+    });
+
+    function toggleRow(id, buttonId) {
+      var row = document.getElementById(id);
+      var btn = buttonId ? document.getElementById(buttonId) : null;
+      var opening = !row.classList.contains('visible');
+      row.classList.toggle('visible', opening);
+      if (btn) {
+        btn.classList.toggle('active', opening);
+        // Keep aria-expanded in sync for screen readers.
+        if (btn.hasAttribute('aria-expanded')) {
+          btn.setAttribute('aria-expanded', opening ? 'true' : 'false');
+        }
+      }
+      autoResize();
+      return opening;
+    }
+
+    function closeSubToolbarIfOpen() {
+      var sub = document.getElementById('sub-toolbar');
+      if (sub && sub.classList.contains('visible')) toggleSubToolbar();
+    }
+
+    function closeCloudPairIfOpen() {
+      var cp = document.getElementById('cloud-pair');
+      if (cp && cp.classList.contains('visible')) {
+        toggleRow('cloud-pair', 'cloud-icon');
+        // Close the help too if it was open
+        var ch = document.getElementById('cloud-help');
+        if (ch && ch.classList.contains('visible')) toggleRow('cloud-help', 'cloud-info-btn');
+      }
+    }
+
+    function toggleCloudPair() {
+      var opening = !document.getElementById('cloud-pair').classList.contains('visible');
+      if (opening) closeSubToolbarIfOpen();
+      toggleRow('cloud-pair', 'cloud-icon');
+      // Re-derive on both open and close: opening shows the current cloud
+      // state (previously it could open onto a stale blank), closing hides
+      // routine states while keeping actionable ones ("pairing lost") visible.
+      renderCloudStatus();
+    }
+
+    function toggleCloudHelp() {
+      toggleRow('cloud-help', 'cloud-info-btn');
+    }
+
+    function toggleSubToolbar() {
+      var opening = !document.getElementById('sub-toolbar').classList.contains('visible');
+      if (opening) closeCloudPairIfOpen();
+      var nowOpen = toggleRow('sub-toolbar', 'expand-btn');
+      document.getElementById('expand-btn').textContent = nowOpen ? '−' : '+';
+      if (!nowOpen) {
+        // Collapse the Activity panel if sub-toolbar closes
+        var log = document.getElementById('log-panel');
+        if (log.classList.contains('visible')) toggleLog();
+      }
+    }
+
+    function toggleLog() {
+      var logVisible = document.getElementById('log-panel').classList.contains('visible');
+      var opening = !logVisible;
+      toggleRow('log-panel', 'log-toggle');
+      // Reveal the Copy button only when the Activity panel is open
+      document.getElementById('copy-log-btn').style.display = opening ? '' : 'none';
+      autoResize();
+    }
+
+    // Follow Figma's theme. With themeColors:true, Figma adds a "figma-light" /
+    // "figma-dark" class to <html> and updates it live when the user switches
+    // themes. We mirror that onto body[data-theme] so the status/log color
+    // tokens track Figma. Falls back to OS preference if the class is absent.
+    function applyTheme() {
+      var root = document.documentElement;
+      var theme;
+      if (root.classList.contains('figma-light')) theme = 'light';
+      else if (root.classList.contains('figma-dark')) theme = 'dark';
+      else theme = (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches) ? 'light' : 'dark';
+      document.body.setAttribute('data-theme', theme);
+    }
+
+    applyTheme();
+    // React to live Figma theme switches (class changes on <html>).
+    if (window.MutationObserver) {
+      new MutationObserver(applyTheme).observe(document.documentElement, { attributes: true, attributeFilter: ['class'] });
+    }
+    // Fallback path: only relevant when no Figma theme class is present.
+    if (window.matchMedia) {
+      window.matchMedia('(prefers-color-scheme: light)').addEventListener('change', applyTheme);
+    }
+
+
+    // ============================================================================
+    // STAGE 2 — LOG PANEL, INFO PANEL, CONNECTION, CLIPBOARD EXPORT
+    // ============================================================================
+
+    var PLUGIN_VERSION = 'v0.3.0';
+    var logHistory = [];
+    var logEntriesEl = null;
+    var _ctaBtn = null;
+    // Timestamp of the most recent command sent through the bridge (the same
+    // event that appends to logHistory) — drives "Last action: Xs ago".
+    var _lastActionAt = null;
+
+    function ensureLogRefs() {
+      if (!logEntriesEl) logEntriesEl = document.getElementById('log-entries');
+      if (!_ctaBtn) _ctaBtn = document.getElementById('cta-btn');
+    }
+
+    function escHtml(s) {
+      return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    }
+
+    function log(message, level, ts) {
+      level = level || 'info';
+      ensureLogRefs();
+      if (!logEntriesEl) return;
+
+      // Deduplicate: consecutive identical message+level bumps the count badge.
+      var last = logEntriesEl.lastElementChild;
+      if (last && last.dataset.logMsg === message && last.dataset.logLevel === level) {
+        var n = (parseInt(last.dataset.logCount, 10) || 1) + 1;
+        last.dataset.logCount = n;
+        var tsEl = last.querySelector('.log-ts');
+        var countEl = last.querySelector('.log-count');
+        if (tsEl && ts) tsEl.textContent = ts;
+        if (countEl) countEl.textContent = '×' + n;
+        return;
+      }
+
+      var entry = document.createElement('div');
+      entry.className = 'log-entry ' + level;
+      entry.dataset.logMsg = message;
+      entry.dataset.logLevel = level;
+      entry.dataset.logCount = '1';
+      entry.innerHTML =
+        '<span class="log-ts">' + escHtml(ts || '') + '</span>' +
+        '<span class="log-msg" title="' + escHtml(message) + '">' + escHtml(message) + '</span>' +
+        '<span class="log-dur"></span>' +
+        '<span class="log-count"></span>';
+      logEntriesEl.appendChild(entry);
+      logEntriesEl.scrollTop = logEntriesEl.scrollHeight;
+      while (logEntriesEl.children.length > 50) {
+        logEntriesEl.removeChild(logEntriesEl.children[0]);
+      }
+    }
+
+    function logWithHistory(message, level) {
+      level = level || 'info';
+      var now = new Date();
+      var ts = ('0' + now.getHours()).slice(-2) + ':' +
+               ('0' + now.getMinutes()).slice(-2) + ':' +
+               ('0' + now.getSeconds()).slice(-2);
+      logHistory.push({ ts: now.toISOString().replace('T', ' ').replace(/\.\d+Z/, ''), level: level, message: message });
+      log(message, level, ts);
+    }
+
+    function copyLogToClipboard() {
+      var lines = logHistory.map(function(e) {
+        var prefix = e.level === 'error' ? '[!]  ' : e.level === 'warn' ? '[WARN]  ' : '';
+        return e.ts + '  ' + prefix + e.message;
+      });
+      var text = 'Figma Desktop Bridge - Session Log\n'
+        + 'Exported: ' + new Date().toISOString() + '\n'
+        + 'Plugin: ' + PLUGIN_VERSION + '\n'
+        + '------------------------------------------------\n'
+        + lines.join('\n') + '\n';
+      var ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      var ok = false;
+      try { ok = document.execCommand('copy'); } catch (e) {}
+      document.body.removeChild(ta);
+      if (ok) {
+        logWithHistory('Copied to clipboard (' + logHistory.length + ' entries)', 'success');
+      } else {
+        logWithHistory('Copy failed - clipboard not available', 'error');
+      }
+    }
+
+    // Smart command summariser: turns raw message types and EXECUTE_CODE
+    // payloads into human-readable log lines.
+    var COMMAND_LABELS = {
+      'GET_FILE_INFO': 'Get file info',
+      'REFRESH_VARIABLES': 'Refresh variables',
+      'GET_LOCAL_COMPONENTS': 'Get local components',
+      'CLEAR_CONSOLE': 'Clear console',
+      'RELOAD_UI': 'Reload UI',
+      'GET_VARIABLES_DATA': 'Get variables data',
+      'RESIZE_UI': null // internal, don't log
+    };
+
+    var FIGMA_API_PATTERNS = [
+      { re: /figma\.create(\w+)/,           fn: function(m) { return 'Create ' + camelToWords(m[1]); } },
+      { re: /figma\.getNodeByIdAsync/,      fn: function()  { return 'Get node'; } },
+      { re: /figma\.setCurrentPageAsync/,   fn: function()  { return 'Switch page'; } },
+      { re: /figma\.loadFontAsync/,         fn: function()  { return 'Load font'; } },
+      { re: /figma\.loadAllPagesAsync/,     fn: function()  { return 'Load all pages'; } },
+      { re: /figma\.currentPage\.findAll/,  fn: function()  { return 'Find nodes'; } },
+      { re: /figma\.currentPage\.findOne/,  fn: function()  { return 'Find node'; } },
+      { re: /figma\.(union|subtract|intersect|flatten)\b/, fn: function(m) { return 'Boolean ' + m[1]; } },
+      { re: /\.exportAsync/,                fn: function()  { return 'Export'; } },
+      { re: /\.clone\(\)/,                  fn: function()  { return 'Clone node'; } },
+      { re: /\.remove\(\)/,                 fn: function()  { return 'Remove node'; } },
+      { re: /\.appendChild\b/,              fn: function()  { return 'Append child'; } },
+      { re: /\.insertChild\b/,              fn: function()  { return 'Insert child'; } },
+      { re: /\.resize\(/,                   fn: function()  { return 'Resize'; } },
+      { re: /\.characters\s*=/,             fn: function()  { return 'Set text'; } },
+      { re: /\.fills\s*=/,                  fn: function()  { return 'Set fills'; } },
+      { re: /\.strokes\s*=/,                fn: function()  { return 'Set strokes'; } },
+      { re: /\.effects\s*=/,                fn: function()  { return 'Set effects'; } },
+      { re: /combineAsVariants/,            fn: function()  { return 'Combine as variants'; } },
+      { re: /swapComponent/,                fn: function()  { return 'Swap component'; } }
+    ];
+
+    function camelToWords(s) {
+      return s.replace(/([a-z])([A-Z])/g, '$1 $2').toLowerCase();
+    }
+
+    function truncate(s, max) {
+      max = max || 60;
+      if (s.length <= max) return s;
+      return s.substring(0, max - 1) + '…';
+    }
+
+    function summariseCommand(type, params) {
+      if (type === 'EXECUTE_CODE' && params && params.code) {
+        var firstLine = params.code.trim().split('\n')[0].trim();
+        if (firstLine.indexOf('//') === 0) {
+          return truncate(firstLine.replace(/^\/\/\s*/, '').replace(/[—–]/g, '-'));
+        }
+        var hits = [];
+        for (var i = 0; i < FIGMA_API_PATTERNS.length; i++) {
+          var m = params.code.match(FIGMA_API_PATTERNS[i].re);
+          if (m) hits.push(FIGMA_API_PATTERNS[i].fn(m));
+        }
+        if (hits.length > 0) {
+          var unique = hits.filter(function(v, i, a) { return a.indexOf(v) === i; });
+          // Drop "Get node" when it appears alongside a more specific operation — it's just boilerplate setup
+          var meaningful = unique.length > 1
+            ? unique.filter(function(v) { return v !== 'Get node'; })
+            : unique;
+          return truncate(meaningful.join(', '));
+        }
+        // No recognisable Figma API pattern — prefix with <Code> so engineers can spot it, then show first line for context
+        var lines = params.code.split('\n');
+        for (var j = 0; j < lines.length; j++) {
+          var line = lines[j].trim();
+          if (line && line.indexOf('//') !== 0 && line.indexOf('/*') !== 0) {
+            return truncate('<Code> ' + line);
+          }
+        }
+        return '<Code>';
+      }
+      if (COMMAND_LABELS.hasOwnProperty(type)) return COMMAND_LABELS[type];
+      // Fallback: turn "RENAME_VARIABLE" into "Rename variable"
+      return type.replace(/_/g, ' ').toLowerCase().replace(/^\w/, function(c) { return c.toUpperCase(); });
+    }
+
+    // Wrap sendPluginCommand so every sent command is logged with a human summary and duration.
+    var _origSendPluginCommand = window.sendPluginCommand;
+    window.sendPluginCommand = function(type, params, timeoutMs) {
+      var summary = summariseCommand(type, params);
+      var durEntry = null;
+      var histIdx = -1;
+      if (summary) {
+        _lastActionAt = Date.now();
+        logWithHistory(summary, 'info');
+        histIdx = logHistory.length - 1;
+        ensureLogRefs();
+        durEntry = logEntriesEl ? logEntriesEl.lastElementChild : null;
+      }
+      var t0 = Date.now();
+      return _origSendPluginCommand(type, params, timeoutMs).then(
+        function(result) {
+          if (durEntry) {
+            var d = durEntry.querySelector('.log-dur');
+            if (d) d.textContent = (Date.now() - t0) + 'ms';
+            if (result && result.success === false) {
+              durEntry.className = durEntry.className.replace(/\b(info|success|warn)\b/, 'error');
+              durEntry.dataset.logLevel = 'error';
+              var m = durEntry.querySelector('.log-msg');
+              if (m && m.textContent.indexOf('[!]') !== 0) m.textContent = '[!] ' + m.textContent;
+              if (histIdx >= 0 && logHistory[histIdx]) {
+                logHistory[histIdx].level = 'error';
+              }
+            }
+          }
+          return result;
+        },
+        function(err) {
+          if (durEntry) {
+            var d = durEntry.querySelector('.log-dur');
+            if (d) d.textContent = (Date.now() - t0) + 'ms';
+            durEntry.className = durEntry.className.replace(/\b(info|success|warn)\b/, 'error');
+            durEntry.dataset.logLevel = 'error';
+            var m = durEntry.querySelector('.log-msg');
+            if (m && m.textContent.indexOf('[!]') !== 0) m.textContent = '[!] ' + m.textContent;
+            if (histIdx >= 0 && logHistory[histIdx]) {
+              logHistory[histIdx].level = 'error';
+              logHistory[histIdx].message = '[!] ' + logHistory[histIdx].message;
+            }
+          }
+          throw err;
+        }
+      );
+    };
+
+    // Plugin update banner — shown when the server pushes
+    // PLUGIN_UPDATE_AVAILABLE over the WebSocket. Dismiss sticks for the
+    // session so repeated pushes don't nag.
+    var _updateBannerDismissed = false;
+    function showUpdateBanner() {
+      if (_updateBannerDismissed) return;
+      var b = document.getElementById('update-banner');
+      if (b && !b.classList.contains('visible')) {
+        b.classList.add('visible');
+        autoResize();
+      }
+    }
+    function dismissUpdateBanner() {
+      _updateBannerDismissed = true;
+      var b = document.getElementById('update-banner');
+      if (b && b.classList.contains('visible')) {
+        b.classList.remove('visible');
+        autoResize();
+      }
+    }
+
+    // True while a cloud relay connection is live in the shared pool.
+    function hasLiveCloudConnection() {
+      var conns = (typeof window.__wsGetActiveConnections === 'function') ? (window.__wsGetActiveConnections() || []) : [];
+      return conns.some(function(c) { return c && c.port === 'cloud' && c.ws && c.ws.readyState === 1; });
+    }
+
+    // Real Pause / Resume: toggles the local WebSocket bridge.
+    function setCtaState(state) {
+      ensureLogRefs();
+      if (!_ctaBtn) return;
+      _ctaBtn.style.display = ''; // markup starts it hidden until first honest state
+      if (state === 'on')            { _ctaBtn.textContent = 'Pause';        _ctaBtn.disabled = false; }
+      else if (state === 'paused')   { _ctaBtn.textContent = 'Resume';       _ctaBtn.disabled = false; }
+      else if (state === 'reconnect'){ _ctaBtn.textContent = 'Try again';    _ctaBtn.disabled = false; }
+      else if (state === 'scanning') { _ctaBtn.textContent = 'Connecting…';  _ctaBtn.disabled = true; }
+    }
+
+    function toggleLocalConnection() {
+      ensureLogRefs();
+      if (!_ctaBtn) return;
+      var label = _ctaBtn.textContent;
+      if (label === 'Pause') {
+        // Remember a live cloud connection so Resume can restore it.
+        _cloudWasConnectedBeforePause = hasLiveCloudConnection();
+        if (typeof window.__wsDisconnectAll === 'function') window.__wsDisconnectAll();
+        setCtaState('paused');
+        deriveAndRenderStatus();
+        logWithHistory('Paused', 'warn');
+      } else if (label === 'Resume' || label === 'Try again') {
+        setCtaState('scanning');
+        logWithHistory('Looking for your AI app…', 'info');
+        if (typeof window.__wsManualScan === 'function') window.__wsManualScan();
+        else if (typeof window.__wsScanAndConnect === 'function') window.__wsScanAndConnect();
+        // Re-establish the cloud connection if one existed before Pause
+        // (the scan above only covers localhost ports).
+        if (_cloudWasConnectedBeforePause) {
+          _cloudWasConnectedBeforePause = false;
+          if (_lastCloudCode && !_cloudUserDisconnected) {
+            _cloudRetryCount = 0;
+            cloudDial(_lastCloudCode, true);
+          }
+        }
+        deriveAndRenderStatus();
+        // Watch for connection success or scan timeout.
+        var attempts = 0;
+        var poller = setInterval(function() {
+          attempts++;
+          var n = window.__wsGetActiveConnections ? window.__wsGetActiveConnections().length : 0;
+          if (n > 0) {
+            clearInterval(poller);
+            setCtaState('on');
+            deriveAndRenderStatus();
+          } else if (attempts > 20) { // ~10s max
+            clearInterval(poller);
+            setCtaState('reconnect');
+            deriveAndRenderStatus();
+            logWithHistory('Couldn\'t find your AI app. Open Claude (or your AI assistant), then press Try again.', 'error');
+          }
+        }, 500);
+      }
+    }
+
+    // Keep the CTA button honest about the real connection state: a
+    // never-connected or dropped plugin shows a clickable "Try again" instead
+    // of a misleading "Pause". Skips while a scan is mid-flight (button
+    // disabled or __wsIsScanning) to avoid fighting the transient click state.
+    function reconcileCta() {
+      ensureLogRefs();
+      if (!_ctaBtn) return;
+      if (_ctaBtn.disabled) return;
+      if (typeof window.__wsIsScanning === 'function' && window.__wsIsScanning()) return;
+      var n = (typeof window.__wsGetActiveConnections === 'function') ? window.__wsGetActiveConnections().length : 0;
+      var paused = (typeof window.__wsIsPaused === 'function') ? window.__wsIsPaused() : false;
+      if (paused) {
+        if (_ctaBtn.textContent !== 'Resume') setCtaState('paused');
+      } else if (n > 0) {
+        if (_ctaBtn.textContent !== 'Pause') setCtaState('on');
+      } else {
+        if (_ctaBtn.textContent !== 'Try again') setCtaState('reconnect');
+      }
+      // First reconcile also unhides the button with its honest label.
+      if (_ctaBtn.style.display === 'none') _ctaBtn.style.display = '';
+    }
+
+    // Periodic reconcile of CTA + status pill/meta (cheap, <1ms). Also
+    // refreshes "Last action: Xs ago" via renderStatusMeta inside
+    // deriveAndRenderStatus.
+    setInterval(function() {
+      reconcileCta();
+      deriveAndRenderStatus();
+    }, 2000);
+
+    // One-shot on first ready: render honest initial state and capture the
+    // plugin's own version (used in the Activity export header) without
+    // logging a command line — hence the unwrapped sender. The version is
+    // read from the GET_FILE_INFO_RESULT handler below.
+    setTimeout(function() {
+      reconcileCta();
+      deriveAndRenderStatus();
+      _origSendPluginCommand('GET_FILE_INFO', {}).catch(function() { /* ignore */ });
+    }, 500);
+
+    // Size the plugin window to fit content on first paint.
+    requestAnimationFrame(autoResize);
+
+    // Single source of truth for the cloud pairing status line — derives the
+    // text from actual state (same philosophy as deriveAndRenderStatus for the
+    // pill) instead of trusting one-off events. Every string is prefixed
+    // "Cloud" so it can never read as the plugin's overall status, and the
+    // line stays empty (hidden via :not(:empty)) unless it has something
+    // useful to say — a background failure like an expired pairing code
+    // restored from a previous session stays silent. Transient messages
+    // ("Cloud: connecting…", bad-code errors) are written directly by
+    // cloudDial/cloudConnect and survive until the next state change.
+    function renderCloudStatus() {
+      var statusEl = document.getElementById('cloud-status');
+      if (!statusEl) return;
+      var cp = document.getElementById('cloud-pair');
+      var panelOpen = !!(cp && cp.classList.contains('visible'));
+      var paused = (typeof window.__wsIsPaused === 'function') ? window.__wsIsPaused() : false;
+
+      if (paused) {
+        // Pause closes the cloud socket deliberately and Resume redials it —
+        // never present that as a lost pairing (retry is suppressed while
+        // paused, so "reconnecting…" would also be untrue).
+        statusEl.textContent = panelOpen ? 'Cloud: paused' : '';
+        statusEl.className = 'cloud-status';
+      } else if (hasLiveCloudConnection()) {
+        statusEl.textContent = panelOpen ? 'Cloud: connected' : '';
+        statusEl.className = 'cloud-status connected';
+      } else if (!_cloudUserDisconnected && _cloudEverConnected && _cloudRetryCount < CLOUD_MAX_RETRIES) {
+        // Paired earlier this session and dropped — actionable, so it shows
+        // even while the panel is collapsed.
+        statusEl.textContent = 'Cloud pairing lost — reconnecting…';
+        statusEl.className = 'cloud-status';
+      } else if (!_cloudUserDisconnected && _cloudEverConnected) {
+        statusEl.textContent = 'Cloud pairing lost. Generate a fresh code in Claude and reconnect.';
+        statusEl.className = 'cloud-status error';
+      } else {
+        statusEl.textContent = panelOpen ? 'Cloud: not connected' : '';
+        statusEl.className = 'cloud-status';
+      }
+      autoResize();
     }
 
     function resetCloudUI() {
-      var statusEl = document.getElementById('cloud-status');
       var btn = document.getElementById('cloud-btn');
-      if (statusEl) {
-        statusEl.textContent = 'Disconnected';
-        statusEl.className = 'cloud-status';
-      }
+      renderCloudStatus();
       if (btn) {
         btn.disabled = false;
         btn.textContent = 'Connect';
@@ -1102,36 +2281,42 @@
       cloudWs = null;
     }
 
-    function cloudConnect() {
-      var codeInput = document.getElementById('cloud-code');
+    // Shared dialer used by manual Connect, auto-reconnect after a drop,
+    // restored-config auto-connect, and Resume-after-Pause. `isAuto` softens
+    // the error UX for background attempts and arms the bounded retry chain.
+    function cloudDial(code, isAuto) {
       var btn = document.getElementById('cloud-btn');
       var statusEl = document.getElementById('cloud-status');
-      var code = (codeInput.value || '').trim().toUpperCase();
 
-      if (!code || code.length < 4) {
-        statusEl.textContent = 'Enter pairing code';
-        statusEl.className = 'cloud-status error';
-        return;
+      // Close existing cloud connection if any (manual reason suppresses
+      // the pool's same-port retry for the old socket).
+      if (cloudWs && cloudWs.readyState <= 1) {
+        try { cloudWs.close(1000, 'Manual disconnect'); } catch (e) {}
       }
 
-      btn.disabled = true;
-      statusEl.textContent = 'Connecting...';
-      statusEl.className = 'cloud-status';
-
-      // Close existing cloud connection if any
-      if (cloudWs && cloudWs.readyState <= 1) {
-        cloudWs.close();
+      if (btn) btn.disabled = true;
+      // Manual attempts show progress; auto re-dials render the derived state
+      // ("Cloud pairing lost — reconnecting…", or silence for a background
+      // restore) so an unlabeled transient never floats under the main pill.
+      if (isAuto) {
+        renderCloudStatus();
+      } else if (statusEl) {
+        statusEl.textContent = 'Cloud: connecting…';
+        statusEl.className = 'cloud-status';
       }
 
       try {
+        var opened = false;
+        var sawError = false;
         cloudWs = new WebSocket(CLOUD_RELAY_HOST + '/ws/pair?code=' + code);
 
         cloudWs.onopen = function() {
-          statusEl.textContent = 'Connected to cloud relay';
-          statusEl.className = 'cloud-status connected';
-          btn.disabled = false;
-          btn.textContent = 'Disconnect';
-          btn.onclick = cloudDisconnect;
+          opened = true;
+          _lastCloudCode = code;
+          _cloudUserDisconnected = false;
+          _cloudRetryCount = 0;
+          _cloudEverConnected = true;
+          if (btn) { btn.disabled = false; btn.textContent = 'Disconnect'; btn.onclick = cloudDisconnect; }
 
           // Add to the shared connection pool (uses same handlers as localhost).
           // Pass resetCloudUI as disconnect callback — attachWsHandlers overwrites
@@ -1139,6 +2324,9 @@
           if (window.__wsAddCloudConnection) {
             window.__wsAddCloudConnection(cloudWs, 'cloud', resetCloudUI);
           }
+
+          // After the pool add, so hasLiveCloudConnection() sees this socket.
+          renderCloudStatus();
 
           // Persist cloud config via code.js clientStorage
           parent.postMessage({ pluginMessage: {
@@ -1148,27 +2336,76 @@
         };
 
         cloudWs.onerror = function() {
-          statusEl.textContent = 'Connection failed — check code';
-          statusEl.className = 'cloud-status error';
-          btn.disabled = false;
+          sawError = true;
+          if (statusEl && !isAuto) {
+            statusEl.textContent = 'That code didn\'t work. Ask Claude for a fresh pairing code and try again.';
+            statusEl.className = 'cloud-status error';
+          }
+          if (btn) btn.disabled = false;
         };
 
         // Note: onclose here handles pre-connection close (e.g., bad code).
         // After onopen, attachWsHandlers overwrites this — resetCloudUI callback
         // handles post-connection close instead.
         cloudWs.onclose = function(event) {
-          resetCloudUI();
+          if (!opened && sawError && !isAuto) {
+            // Keep the visible error message (onclose fires right after
+            // onerror and would otherwise clobber it); restore the button.
+            if (btn) { btn.disabled = false; btn.textContent = 'Connect'; btn.onclick = cloudConnect; }
+            cloudWs = null;
+          } else {
+            resetCloudUI();
+          }
+          // Auto attempt that never opened → keep trying within the budget.
+          if (isAuto && !opened) scheduleCloudRetry();
         };
       } catch (e) {
-        statusEl.textContent = 'Failed: ' + e.message;
-        statusEl.className = 'cloud-status error';
-        btn.disabled = false;
+        if (statusEl) { statusEl.textContent = 'Failed: ' + e.message; statusEl.className = 'cloud-status error'; }
+        if (btn) btn.disabled = false;
       }
     }
 
+    // Bounded auto-reconnect with backoff. Gives up after CLOUD_MAX_RETRIES,
+    // never fires while paused or after a deliberate user Disconnect.
+    function scheduleCloudRetry() {
+      if (_cloudUserDisconnected || !_lastCloudCode) return;
+      if (typeof window.__wsIsPaused === 'function' && window.__wsIsPaused()) return;
+      if (_cloudRetryCount >= CLOUD_MAX_RETRIES) return;
+      _cloudRetryCount++;
+      setTimeout(function() {
+        if (_cloudUserDisconnected || hasLiveCloudConnection()) return;
+        if (typeof window.__wsIsPaused === 'function' && window.__wsIsPaused()) return;
+        cloudDial(_lastCloudCode, true);
+      }, Math.min(2000 * _cloudRetryCount, 10000));
+    }
+
+    // Called by the connection pool when the pooled cloud connection drops —
+    // re-dials the actual relay URL instead of 'ws://localhost:cloud'.
+    window.__cloudReconnect = function() {
+      scheduleCloudRetry();
+    };
+
+    function cloudConnect() {
+      var codeInput = document.getElementById('cloud-code');
+      var statusEl = document.getElementById('cloud-status');
+      var code = (codeInput.value || '').trim().toUpperCase();
+
+      if (!code || code.length < 4) {
+        statusEl.textContent = 'Enter pairing code';
+        statusEl.className = 'cloud-status error';
+        return;
+      }
+
+      _cloudUserDisconnected = false;
+      _cloudRetryCount = 0;
+      cloudDial(code, false);
+    }
+
     function cloudDisconnect() {
+      _cloudUserDisconnected = true; // deliberate — suppress auto re-dial
+      _cloudEverConnected = false;   // a deliberate disconnect is not a "lost" pairing
       if (cloudWs) {
-        cloudWs.close();
+        try { cloudWs.close(1000, 'Manual disconnect'); } catch (e) {}
       }
       // Reset UI immediately — don't rely on onclose (may be overwritten)
       resetCloudUI();
@@ -1192,6 +2429,17 @@
             if (msg.data !== undefined) result.data = msg.data;
             if (msg.oldName !== undefined) result.oldName = msg.oldName;
             if (msg.instance !== undefined) result.instance = msg.instance;
+            if (msg.slot !== undefined) result.slot = msg.slot;
+            if (msg.warnings !== undefined) result.warnings = msg.warnings;
+            if (msg.updatedCount !== undefined) result.updatedCount = msg.updatedCount;
+            if (msg.nodes !== undefined) result.nodes = msg.nodes;
+            // EXECUTE_CODE reports these two: resultAnalysis (silent-failure
+            // hints, which figma_execute's own description tells callers to
+            // check) and fileContext (the file the code actually ran in, which
+            // is how per-file targeting is verified). code.js has always sent
+            // them; this relay hop dropped them, so they never arrived.
+            if (msg.resultAnalysis !== undefined) result.resultAnalysis = msg.resultAnalysis;
+            if (msg.fileContext !== undefined) result.fileContext = msg.fileContext;
             request.resolve(result);
           } else {
             request.resolve({ success: false, error: msg.error || 'Unknown error' });
@@ -1205,7 +2453,10 @@
         case 'VARIABLES_DATA':
           window.__figmaVariablesData = msg.data;
           window.__figmaVariablesReady = true;
-          updateStatus('ready', true, false);
+          // A Figma-side data event says nothing about the WS connection —
+          // record the fact and let the derived state decide the pill.
+          bridgeError = false;
+          deriveAndRenderStatus();
           console.log('[MCP Bridge] Active - ' + (msg.data.variables?.length || 0) + ' vars');
           // Forward to WebSocket client if connected
           if (window.__wsForwardVariables) window.__wsForwardVariables(msg.data);
@@ -1224,7 +2475,8 @@
 
         case 'ERROR':
           window.__figmaVariablesReady = false;
-          updateStatus('error', false, true);
+          bridgeError = true; // pill shows "Something broke" + reopen hint
+          deriveAndRenderStatus();
           console.error('[MCP Bridge] Error:', msg.error);
           break;
 
@@ -1268,6 +2520,11 @@
         case 'INSTANTIATE_COMPONENT_RESULT':
           handleResult('INSTANTIATE_COMPONENT', 'instance');
           break;
+        // Component set creation (payload flows via msg.data — already on the
+        // handleResult whitelist, so no new top-level fields to forward)
+        case 'CREATE_COMPONENT_SET_RESULT':
+          handleResult('CREATE_COMPONENT_SET', null);
+          break;
 
         // NEW: Component property operations
         case 'SET_NODE_DESCRIPTION_RESULT':
@@ -1281,6 +2538,18 @@
           break;
         case 'DELETE_COMPONENT_PROPERTY_RESULT':
           handleResult('DELETE_COMPONENT_PROPERTY', null);
+          break;
+        case 'CREATE_SLOT_RESULT':
+          handleResult('CREATE_SLOT', 'slot');
+          break;
+        case 'GET_SLOTS_RESULT':
+          handleResult('GET_SLOTS', null);
+          break;
+        case 'APPEND_TO_SLOT_RESULT':
+          handleResult('APPEND_TO_SLOT', 'appendedNode');
+          break;
+        case 'RESET_SLOT_RESULT':
+          handleResult('RESET_SLOT', 'slot');
           break;
 
         // NEW: Node manipulation operations
@@ -1331,6 +2600,9 @@
         case 'LINT_DESIGN_RESULT':
           handleResult('LINT_DESIGN', 'data');
           break;
+        case 'AUDIT_COMPONENT_ACCESSIBILITY_RESULT':
+          handleResult('AUDIT_COMPONENT_ACCESSIBILITY', 'data');
+          break;
 
         // FigJam tools
         case 'CREATE_STICKY_RESULT':
@@ -1344,6 +2616,9 @@
           break;
         case 'CREATE_SHAPE_WITH_TEXT_RESULT':
           handleResult('CREATE_SHAPE_WITH_TEXT', 'data');
+          break;
+        case 'CREATE_SECTION_RESULT':
+          handleResult('CREATE_SECTION', 'data');
           break;
         case 'CREATE_TABLE_RESULT':
           handleResult('CREATE_TABLE', 'data');
@@ -1398,6 +2673,12 @@
         case 'SKIP_SLIDE_RESULT':
           handleResult('SKIP_SLIDE', 'data');
           break;
+        case 'GET_TEXT_STYLES_RESULT':
+          handleResult('GET_TEXT_STYLES', 'data');
+          break;
+        case 'SET_SLIDE_BACKGROUND_RESULT':
+          handleResult('SET_SLIDE_BACKGROUND', 'data');
+          break;
         case 'ADD_TEXT_TO_SLIDE_RESULT':
           handleResult('ADD_TEXT_TO_SLIDE', 'data');
           break;
@@ -1407,7 +2688,29 @@
 
         // File info
         case 'GET_FILE_INFO_RESULT':
+          // Capture the plugin's own version for the Activity export header
+          // (moved here from the deleted Info panel so any GET_FILE_INFO
+          // response keeps it fresh, regardless of who asked).
+          var fileInfo = msg.fileInfo || msg.data;
+          if (fileInfo && fileInfo.pluginVersion) {
+            PLUGIN_VERSION = 'v' + fileInfo.pluginVersion;
+          }
           handleResult('GET_FILE_INFO', 'fileInfo');
+          break;
+
+        // Cloud config restored from clientStorage by code.js — auto-fill the
+        // pairing input and reconnect without making the user re-pair.
+        case 'CLOUD_CONFIG_RESTORED':
+          if (msg.config && msg.config.code && !_cloudUserDisconnected) {
+            var restoredCode = String(msg.config.code).trim().toUpperCase();
+            var restoredInput = document.getElementById('cloud-code');
+            if (restoredInput) restoredInput.value = restoredCode;
+            if (restoredCode.length >= 4 && !hasLiveCloudConnection()) {
+              _lastCloudCode = restoredCode;
+              _cloudRetryCount = 0;
+              cloudDial(restoredCode, true);
+            }
+          }
           break;
 
         // Plugin UI reload
@@ -1439,6 +2742,11 @@
         // Document change events (for cache invalidation via WebSocket)
         case 'DOCUMENT_CHANGE':
           if (window.__wsForwardDocumentChange) window.__wsForwardDocumentChange(msg.data);
+          break;
+
+        // v1.25.0: metadata change events (description/annotation edits via Plugin API)
+        case 'METADATA_CHANGE':
+          if (window.__wsForwardMetadataChange) window.__wsForwardMetadataChange(msg.data);
           break;
 
         // Console capture events (for console monitoring via WebSocket)

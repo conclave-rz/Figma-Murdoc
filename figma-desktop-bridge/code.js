@@ -1,22 +1,26 @@
 // Figma Desktop Bridge - MCP Plugin
-// Bridges Figma API to MCP clients via plugin UI window
-// Supports: Variables, Components, Styles, and more
-// Uses postMessage to communicate with UI, bypassing worker sandbox limitations
-// Puppeteer can access UI iframe's window context to retrieve data
+// Bridges the Figma Plugin API to MCP clients via the plugin's UI iframe.
+// Supports: Variables, Components, Styles, and more.
+// Uses postMessage to communicate with ui.html (bypassing worker sandbox limitations),
+// which then forwards messages to the MCP server over the WebSocket bridge.
 
 // Plugin version — sent in FILE_INFO for server-side version compatibility checks.
-// The server compares this against its own version to detect stale cached plugins.
-var PLUGIN_VERSION = '1.14.0';
+// The server compares this against the version of the plugin files IT ships to
+// detect stale cached plugins. Bumped by scripts/release.sh ONLY when plugin files
+// change (see issue #62); server-only releases leave it alone, so it may lag
+// package.json — that's intentional, not drift.
+var PLUGIN_VERSION = '1.39.0'; // Last release in which plugin files changed.
 
 console.log('🌉 [Desktop Bridge] Plugin loaded (v' + PLUGIN_VERSION + ')');
 
 // Show minimal UI - compact status indicator
-figma.showUI(__html__, { width: 140, height: 50, visible: true, themeColors: true });
+figma.showUI(__html__, { width: 240, height: 40, visible: true, themeColors: true });
 
 // ============================================================================
 // CONSOLE CAPTURE — Intercept console.* in the QuickJS sandbox and forward
 // to ui.html via postMessage so the WebSocket bridge can relay them to the MCP
-// server. This enables console monitoring without CDP.
+// server. This is the only console-capture path in local mode (no browser
+// process is involved).
 // ============================================================================
 (function() {
   var levels = ['log', 'info', 'warn', 'error', 'debug'];
@@ -147,6 +151,23 @@ var __stickyColors = {
   }
 })();
 
+// Restore persisted cloud pairing config (stored via STORE_CLOUD_CONFIG) and
+// push it to the UI so cloud users don't lose their pairing on plugin reopen.
+// Fire-and-forget: never blocks the FILE_INFO/VARIABLES_DATA pushes above.
+(function() {
+  figma.clientStorage.getAsync('cloudConfig')
+    .then(function(stored) {
+      // Skip if nothing stored or the shape is unusable (e.g., cleared config)
+      if (!stored || !stored.code) return;
+      figma.ui.postMessage({ type: 'CLOUD_CONFIG_RESTORED', config: stored });
+      console.log('🌉 [Desktop Bridge] Restored cloud config from clientStorage');
+    })
+    .catch(function(error) {
+      // clientStorage can throw — non-critical, just log
+      console.warn('🌉 [Desktop Bridge] Could not restore cloud config:', error && error.message ? error.message : String(error));
+    });
+})();
+
 // Helper function to serialize a variable for response
 function serializeVariable(v) {
   return {
@@ -173,6 +194,70 @@ function serializeCollection(c) {
     defaultModeId: c.defaultModeId,
     variableIds: c.variableIds
   };
+}
+
+// Helper to extract a component's SLOT contract (Figma slots, GA June 2026).
+// A slot is part of a component's public API: a named region that accepts freeform
+// content, optionally constrained to preferred component values, with min/max limit
+// violations surfaced on the slot node. Only non-variant COMPONENT and COMPONENT_SET
+// nodes expose componentPropertyDefinitions — reading them on a variant throws, which
+// is why older traversal code caught the error and skipped slot sublayers entirely.
+function extractSlots(node) {
+  function canReadDefs(n) {
+    if (n.type === 'COMPONENT_SET') return true;
+    if (n.type === 'COMPONENT') return !(n.parent && n.parent.type === 'COMPONENT_SET');
+    return false;
+  }
+  if (!canReadDefs(node)) return [];
+  var defs;
+  try { defs = node.componentPropertyDefinitions; } catch (e) { return []; }
+  if (!defs) return [];
+  var byProp = {};
+  for (var k in defs) {
+    if (defs[k] && defs[k].type === 'SLOT') {
+      byProp[k] = {
+        propertyName: k,
+        description: defs[k].description || null,
+        preferredValues: (defs[k].preferredValues || []).slice(),
+        slotNodeIds: [],
+        slotNames: [],
+        limitViolations: []
+      };
+    }
+  }
+  if (Object.keys(byProp).length === 0) return [];
+  // Link each SLOT child node (which carries limitViolations) back to its property
+  // via componentPropertyReferences.slotContentId. A COMPONENT_SET has one SLOT node
+  // per variant pointing at the same property, so results are grouped by property.
+  var slotNodes = [];
+  try { slotNodes = node.findAllWithCriteria({ types: ['SLOT'] }); }
+  catch (e) {
+    try { slotNodes = node.findAll(function(n) { return n.type === 'SLOT'; }); } catch (e2) { slotNodes = []; }
+  }
+  for (var i = 0; i < slotNodes.length; i++) {
+    var sn = slotNodes[i];
+    var refs = sn.componentPropertyReferences || {};
+    var pk = refs.slotContentId;
+    var entry = (pk && byProp[pk]) ? byProp[pk] : null;
+    if (!entry) {
+      entry = byProp[pk || sn.id] = { propertyName: pk || null, description: null, preferredValues: [], slotNodeIds: [], slotNames: [], limitViolations: [] };
+    }
+    entry.slotNodeIds.push(sn.id);
+    if (entry.slotNames.indexOf(sn.name) === -1) entry.slotNames.push(sn.name);
+    var lv = sn.limitViolations || [];
+    for (var j = 0; j < lv.length; j++) { if (entry.limitViolations.indexOf(lv[j]) === -1) entry.limitViolations.push(lv[j]); }
+  }
+  return Object.keys(byProp).map(function(key) {
+    var e = byProp[key];
+    return {
+      name: e.slotNames[0] || e.propertyName,
+      propertyName: e.propertyName,
+      description: e.description,
+      preferredValues: e.preferredValues,
+      instanceCount: e.slotNodeIds.length,
+      limitViolations: e.limitViolations
+    };
+  });
 }
 
 // Helper to convert hex color to Figma RGB (0-1 range)
@@ -217,61 +302,191 @@ function hexToFigmaRGB(hex) {
   return { r: r, g: g, b: b, a: a };
 }
 
+// Build the ordered list of font-style names to try for a requested style.
+// Figma style names are exact and space-sensitive: Inter's semibold is
+// "Semi Bold" (with a space), not "SemiBold". We try the value as-is first
+// (some families legitimately use no-space names), then a space-normalized
+// variant, then a space-collapsed variant.
+function normalizeFontStyleVariants(style) {
+  var variants = [];
+  function push(v) { if (v && variants.indexOf(v) === -1) variants.push(v); }
+  push(style);
+  push(String(style).replace(/([a-z])([A-Z])/g, '$1 $2')); // "SemiBold" -> "Semi Bold"
+  push(String(style).replace(/\s+/g, ''));                   // "Semi Bold" -> "SemiBold"
+  return variants;
+}
+
+// Load a font, tolerating common style-name variants. A wrong style name
+// otherwise fails (often silently), leaving wrong typography with no error.
+// Falls back to "Regular" so a bad weight degrades gracefully, and throws a
+// clear, actionable error only if nothing loads.
+async function loadFontWithFallback(family, requestedStyle) {
+  var style = requestedStyle || 'Regular';
+  var attempts = normalizeFontStyleVariants(style);
+  for (var i = 0; i < attempts.length; i++) {
+    try {
+      var fontName = { family: family, style: attempts[i] };
+      await figma.loadFontAsync(fontName);
+      return fontName;
+    } catch (e) { /* try next variant */ }
+  }
+  try {
+    var fallback = { family: family, style: 'Regular' };
+    await figma.loadFontAsync(fallback);
+    return fallback;
+  } catch (e) {
+    throw new Error('Could not load font "' + family + ' ' + style + '". Tried: ' +
+      attempts.join(', ') + ', Regular. Check the family name and that the weight exists ' +
+      '(Figma styles are space-sensitive, e.g. "Semi Bold" not "SemiBold").');
+  }
+}
+
+// Pre-load every font used by a node's text descendants in ONE pass. Mutating
+// a text node in dynamic-page mode throws unless its font is loaded first;
+// loading per-node in a loop is also what causes timeouts at scale.
+async function loadFontsForNode(node) {
+  if (!node) return;
+  var textNodes = [];
+  if (node.type === 'TEXT') {
+    textNodes = [node];
+  } else if (typeof node.findAllWithCriteria === 'function') {
+    try { textNodes = node.findAllWithCriteria({ types: ['TEXT'] }); }
+    catch (e) { textNodes = []; }
+  } else if (typeof node.findAll === 'function') {
+    textNodes = node.findAll(function(n) { return n.type === 'TEXT'; });
+  }
+  var seen = {};
+  var fonts = [];
+  for (var i = 0; i < textNodes.length; i++) {
+    var tn = textNodes[i];
+    var names = [];
+    if (tn.fontName === figma.mixed) {
+      try { names = tn.getRangeAllFontNames(0, tn.characters.length); }
+      catch (e) { names = []; }
+    } else if (tn.fontName) {
+      names = [tn.fontName];
+    }
+    for (var j = 0; j < names.length; j++) {
+      var key = names[j].family + '||' + names[j].style;
+      if (!seen[key]) { seen[key] = true; fonts.push(names[j]); }
+    }
+  }
+  for (var k = 0; k < fonts.length; k++) {
+    try { await figma.loadFontAsync(fonts[k]); } catch (e) { /* skip unavailable */ }
+  }
+}
+
+// Resolve a caller-supplied component property name against the instance's
+// actual property keys. TEXT/BOOLEAN/INSTANCE_SWAP property names carry a
+// #nodeId suffix (e.g. "title#2605:17"), so a bare "title" from the caller
+// must be mapped to the suffixed key. Resolution tiers:
+//   1. Exact match (covers VARIANT props and fully-suffixed names)
+//   2. Base name before '#' matches exactly
+//   3. Case-insensitive base-name match
+// Returns the resolved key, or null if nothing matches.
+function resolvePropertyName(currentProps, name) {
+  if (!currentProps || !name) return null;
+  if (currentProps[name] !== undefined) return name;
+  var existingProp;
+  for (existingProp in currentProps) {
+    if (currentProps.hasOwnProperty(existingProp) && existingProp.split('#')[0] === name) {
+      return existingProp;
+    }
+  }
+  var lowerName = String(name).toLowerCase();
+  for (existingProp in currentProps) {
+    if (currentProps.hasOwnProperty(existingProp) && existingProp.split('#')[0].toLowerCase() === lowerName) {
+      return existingProp;
+    }
+  }
+  return null;
+}
+
+// ============================================================================
+// Slot helpers — Figma Slots open beta (SlotNode API)
+// ============================================================================
+
+function serializeSlotsFromNode(rootNode) {
+  var slots = [];
+  if (!rootNode || typeof rootNode.findAllWithCriteria !== 'function') {
+    return slots;
+  }
+
+  var slotNodes = rootNode.findAllWithCriteria({ types: ['SLOT'] });
+  for (var si = 0; si < slotNodes.length; si++) {
+    var slot = slotNodes[si];
+    var slotInfo = {
+      id: slot.id,
+      name: slot.name,
+      type: 'SLOT',
+      width: slot.width,
+      height: slot.height,
+      layoutMode: slot.layoutMode || 'NONE',
+      propertyKey: null,
+      children: []
+    };
+
+    try {
+      if (slot.componentPropertyReferences && slot.componentPropertyReferences.slotContentId) {
+        slotInfo.propertyKey = slot.componentPropertyReferences.slotContentId;
+      }
+    } catch (e) { /* ignore */ }
+
+    try {
+      for (var ci = 0; ci < slot.children.length; ci++) {
+        var ch = slot.children[ci];
+        slotInfo.children.push({ id: ch.id, name: ch.name, type: ch.type });
+      }
+    } catch (e) { /* slot sublayer — skip inaccessible children */ }
+
+    slots.push(slotInfo);
+  }
+
+  return slots;
+}
+
+async function resolveSlotNode(params) {
+  if (params.slotId) {
+    var slotById = await figma.getNodeByIdAsync(params.slotId);
+    if (!slotById) {
+      throw new Error('Slot node not found: ' + params.slotId);
+    }
+    if (slotById.type !== 'SLOT') {
+      throw new Error('Node is not a SLOT. Got: ' + slotById.type);
+    }
+    return slotById;
+  }
+
+  if (params.instanceId && params.slotName) {
+    var instance = await figma.getNodeByIdAsync(params.instanceId);
+    if (!instance) {
+      throw new Error('Instance node not found: ' + params.instanceId);
+    }
+    if (instance.type !== 'INSTANCE') {
+      throw new Error('Node must be an INSTANCE when using instanceId + slotName. Got: ' + instance.type);
+    }
+    if (typeof instance.findAllWithCriteria !== 'function') {
+      throw new Error('Instance does not support slot lookup');
+    }
+    var allSlots = instance.findAllWithCriteria({ types: ['SLOT'] });
+    var matches = allSlots.filter(function(n) {
+      return n.name === params.slotName;
+    });
+    if (matches.length === 0) {
+      var available = allSlots.map(function(n) { return n.name; });
+      throw new Error('Slot "' + params.slotName + '" not found on instance. Available slots: ' + (available.length ? available.join(', ') : '(none)'));
+    }
+    // findAllWithCriteria is deep — a nested instance can carry an identically
+    // named slot. Prefer the instance's OWN slot (direct child) over nested ones.
+    var direct = matches.filter(function(n) { return n.parent === instance; });
+    return (direct.length ? direct : matches)[0];
+  }
+
+  throw new Error('Provide slotId OR (instanceId + slotName)');
+}
+
 // Listen for requests from UI (e.g., component data requests, write operations)
 figma.ui.onmessage = async (msg) => {
-
-  // ============================================================================
-  // BOOT_LOAD_UI - Bootloader fetched fresh UI HTML from the MCP server.
-  // Replace the bootloader with the full, always-up-to-date plugin UI.
-  // This uses figma.showUI() with the HTML string directly — no redirects,
-  // no cross-origin, no CSP issues.
-  // ============================================================================
-  if (msg.type === 'BOOT_LOAD_UI' && msg.html) {
-    console.log('🌉 [Desktop Bridge] Bootloader delivered fresh UI (' + msg.html.length + ' bytes), loading...');
-    figma.showUI(msg.html, { width: 140, height: 50, visible: true, themeColors: true });
-
-    // Re-send variables data to the fresh UI — the original send went to the
-    // bootloader which discarded it. The fresh UI needs it to show "ready" status.
-    (async function() {
-      try {
-        var variables = await figma.variables.getLocalVariablesAsync();
-        var collections = await figma.variables.getLocalVariableCollectionsAsync();
-        figma.ui.postMessage({
-          type: 'VARIABLES_DATA',
-          data: {
-            success: true,
-            timestamp: Date.now(),
-            fileKey: figma.fileKey || null,
-            variables: variables.map(function(v) { return {
-              id: v.id, name: v.name, key: v.key, resolvedType: v.resolvedType,
-              valuesByMode: v.valuesByMode, variableCollectionId: v.variableCollectionId,
-              scopes: v.scopes, codeSyntax: v.codeSyntax || {}, description: v.description, hiddenFromPublishing: v.hiddenFromPublishing
-            }; }),
-            variableCollections: collections.map(function(c) { return {
-              id: c.id, name: c.name, key: c.key, modes: c.modes,
-              defaultModeId: c.defaultModeId, variableIds: c.variableIds
-            }; })
-          }
-        });
-        console.log('🌉 [Desktop Bridge] Re-sent variables to fresh UI (' + variables.length + ' vars)');
-      } catch (e) {
-        console.log('🌉 [Desktop Bridge] Could not re-send variables:', e.message || e);
-      }
-    })();
-    return;
-  }
-
-  // ============================================================================
-  // BOOT_FALLBACK - Bootloader found an old server that doesn't support the
-  // bootloader protocol. Fall back to reloading the cached __html__ which
-  // contains the full UI (for users who haven't switched to the bootloader yet,
-  // __html__ IS the full UI; for bootloader users, this is a no-op reload).
-  // ============================================================================
-  if (msg.type === 'BOOT_FALLBACK') {
-    console.log('🌉 [Desktop Bridge] Old server detected on port ' + msg.port + ', using cached UI');
-    figma.showUI(__html__, { width: 140, height: 50, visible: true, themeColors: true });
-    return;
-  }
 
   // ============================================================================
   // EXECUTE_CODE - Arbitrary code execution (Power Tool)
@@ -376,7 +591,7 @@ figma.ui.onmessage = async (msg) => {
       var errorMsg = error && error.message ? error.message : String(error);
       var errorStack = error && error.stack ? error.stack : '';
 
-      // Log error details as strings so they show up properly in Puppeteer
+      // Log error details as strings so they survive intact through the WebSocket bridge into figma_get_console_logs
       console.error('🌉 [Desktop Bridge] Code execution error: [' + errorName + '] ' + errorMsg);
       if (errorStack) {
         console.error('🌉 [Desktop Bridge] Stack:', errorStack);
@@ -865,10 +1080,22 @@ figma.ui.onmessage = async (msg) => {
           componentPropertyDefinitions: (node.type === 'COMPONENT_SET' || (node.type === 'COMPONENT' && !isVariant))
             ? node.componentPropertyDefinitions
             : undefined,
-          // Get children info (lightweight) — skip unresolvable slot sublayers
+          // Get children info (lightweight) — include SLOT nodes; skip unresolvable slot sublayers
           children: node.children ? node.children.reduce((acc, child) => {
             try {
-              acc.push({ id: child.id, name: child.name, type: child.type });
+              var childInfo = { id: child.id, name: child.name, type: child.type };
+              if (child.type === 'SLOT') {
+                childInfo.isSlot = true;
+                try {
+                  if (child.componentPropertyReferences && child.componentPropertyReferences.slotContentId) {
+                    childInfo.propertyKey = child.componentPropertyReferences.slotContentId;
+                  }
+                } catch (e) { /* ignore */ }
+                try {
+                  childInfo.childCount = child.children ? child.children.length : 0;
+                } catch (e) { /* ignore */ }
+              }
+              acc.push(childInfo);
             } catch (e) { /* slot sublayer or table cell — skip */ }
             return acc;
           }, []) : undefined
@@ -1167,9 +1394,10 @@ figma.ui.onmessage = async (msg) => {
         variantCount: variants.length,
         variantAxes: variantAxes,
         componentProps: componentProps,
+        slots: extractSlots(node),
         stateMachine: stateMachine,
         variants: variantDiffs,
-        ai_instruction: 'Use cssMapping to implement interaction states. diffFromDefault shows only what changes per state — apply these as CSS pseudo-class or attribute overrides. componentProps maps to React/Vue component props (BOOLEAN → boolean prop, TEXT → string prop, INSTANCE_SWAP → ReactNode/slot prop).'
+        ai_instruction: 'Use cssMapping to implement interaction states. diffFromDefault shows only what changes per state — apply these as CSS pseudo-class or attribute overrides. componentProps maps to React/Vue component props (BOOLEAN → boolean prop, TEXT → string prop, INSTANCE_SWAP → ReactNode/slot prop). slots lists Figma SLOT properties — implement each as a named slot / children prop (React: {children} or a named ReactNode prop; Web Components: <slot name>); preferredValues lists the components a slot accepts, and limitViolations flags content that breaks the slot\'s min/max rules. To populate a slot on an instance, use figma_append_to_slot (not figma_set_instance_properties).'
       };
 
       console.log('🌉 [Desktop Bridge] Component set analysis complete. ' + variants.length + ' variants, ' + Object.keys(stateMachine.cssMapping).length + ' CSS mappings');
@@ -1373,6 +1601,10 @@ figma.ui.onmessage = async (msg) => {
           try {
             if (n.componentPropertyDefinitions) props.componentPropertyDefinitions = n.componentPropertyDefinitions;
           } catch (e) {}
+          try {
+            var devSlots = extractSlots(n);
+            if (devSlots.length) props.slots = devSlots;
+          } catch (e) {}
           if (n.type === 'COMPONENT' && n.variantProperties) {
             props.variantProperties = n.variantProperties;
           }
@@ -1493,6 +1725,9 @@ figma.ui.onmessage = async (msg) => {
           }
         }
 
+        var compSlots = extractSlots(node);
+        if (compSlots.length) data.slots = compSlots;
+
         return data;
       }
 
@@ -1567,7 +1802,8 @@ figma.ui.onmessage = async (msg) => {
               type: propDef.type,
               defaultValue: propDef.defaultValue
             };
-          }) : []
+          }) : [],
+          slots: extractSlots(node)
         };
       }
 
@@ -1815,14 +2051,32 @@ figma.ui.onmessage = async (msg) => {
         instance.resize(msg.size.width, msg.size.height);
       }
 
-      // Apply property overrides
+      // Pre-load fonts for the instance's text nodes BEFORE applying overrides.
+      // Text-property overrides mutate text content, which throws in dynamic-page
+      // mode unless the font is already loaded. Loading once up front also avoids
+      // the per-node timeouts seen when fonts are loaded inside a loop.
+      await loadFontsForNode(instance);
+
+      // Track failures so they surface in the result instead of failing silently.
+      var overrideWarnings = [];
+
+      // Apply property overrides. Property keys on the instance carry #nodeId
+      // suffixes ("title#2605:17"), so resolve the caller's bare name first —
+      // otherwise setProperties throws "Could not find a component property".
       if (msg.overrides) {
+        var instanceProps = {};
+        try { instanceProps = instance.componentProperties || {}; } catch (e) { instanceProps = {}; }
         for (var propName in msg.overrides) {
           if (msg.overrides.hasOwnProperty(propName)) {
+            var resolvedName = resolvePropertyName(instanceProps, propName);
             try {
-              instance.setProperties({ [propName]: msg.overrides[propName] });
+              var propsObj = {};
+              propsObj[resolvedName || propName] = msg.overrides[propName];
+              instance.setProperties(propsObj);
             } catch (propError) {
-              console.warn('🌉 [Desktop Bridge] Could not set property ' + propName + ':', propError.message);
+              var pMsg = propError && propError.message ? propError.message : String(propError);
+              console.warn('🌉 [Desktop Bridge] Could not set property ' + propName + ':', pMsg);
+              overrideWarnings.push('override "' + propName + '" failed: ' + pMsg);
             }
           }
         }
@@ -1833,7 +2087,9 @@ figma.ui.onmessage = async (msg) => {
         try {
           instance.setProperties(msg.variant);
         } catch (variantError) {
-          console.warn('🌉 [Desktop Bridge] Could not set variant:', variantError.message);
+          var vMsg = variantError && variantError.message ? variantError.message : String(variantError);
+          console.warn('🌉 [Desktop Bridge] Could not set variant:', vMsg);
+          overrideWarnings.push('variant selection failed: ' + vMsg);
         }
       }
 
@@ -1842,6 +2098,8 @@ figma.ui.onmessage = async (msg) => {
         var parent = await figma.getNodeByIdAsync(msg.parentId);
         if (parent && 'appendChild' in parent) {
           parent.appendChild(instance);
+        } else {
+          overrideWarnings.push('parentId "' + msg.parentId + '" not found or cannot accept children; instance placed on current page');
         }
       }
 
@@ -1858,7 +2116,8 @@ figma.ui.onmessage = async (msg) => {
           y: instance.y,
           width: instance.width,
           height: instance.height
-        }
+        },
+        warnings: overrideWarnings.length ? overrideWarnings : undefined
       });
 
     } catch (error) {
@@ -1869,6 +2128,293 @@ figma.ui.onmessage = async (msg) => {
         requestId: msg.requestId,
         success: false,
         error: errorMsg
+      });
+    }
+  }
+
+  // ============================================================================
+  // CREATE_COMPONENT_SET - Build a component set with variants in one call
+  // Two modes:
+  //   A) baseComponentId + properties: clone the base for every combination of
+  //      the property axes ({State:[default,hover], Size:[sm,lg]} → 4 variants),
+  //      rename each to "Prop=Value, Prop=Value", combineAsVariants.
+  //      The base component itself BECOMES the first variant (same node ID),
+  //      so existing instances of the base survive as instances of that variant.
+  //   B) componentIds (+ optional variantProperties): combine existing local
+  //      COMPONENT nodes as variants, optionally renaming them first.
+  // Variant properties are derived by Figma from the "Prop=Value" names, and
+  // componentPropertyDefinitions live on the resulting SET (not the variants).
+  // No text is written here, so no font loading is needed (clone() copies text
+  // without touching characters).
+  // ============================================================================
+  else if (msg.type === 'CREATE_COMPONENT_SET') {
+    try {
+      console.log('🌉 [Desktop Bridge] Creating component set:', msg.name || msg.baseComponentId || (msg.componentIds && msg.componentIds.length + ' components'));
+
+      var MAX_VARIANTS = 100;
+      var setWarnings = [];
+      // Rollback state — if anything throws before combineAsVariants succeeds,
+      // remove Mode A clones, restore the base's name, AND restore every
+      // Mode B component the handler renamed, so no partial artifacts remain.
+      // (Previously only Mode A was rolled back: a throw from the
+      // duplicate-combo check or combineAsVariants left the user's standalone
+      // components permanently renamed with no set created.)
+      var createdClones = [];
+      var renamedBase = null;
+      var originalBaseName = null;
+      var renamedNodes = []; // Mode B: [{ node, originalName }]
+      var combineDone = false;
+
+      function rollbackComponentSetWork() {
+        for (var rc = 0; rc < createdClones.length; rc++) {
+          try { createdClones[rc].remove(); } catch (e) {}
+        }
+        createdClones = [];
+        if (renamedBase && originalBaseName !== null) {
+          try { renamedBase.name = originalBaseName; } catch (e) {}
+          renamedBase = null;
+        }
+        for (var rn = 0; rn < renamedNodes.length; rn++) {
+          try { renamedNodes[rn].node.name = renamedNodes[rn].originalName; } catch (e) {}
+        }
+        renamedNodes = [];
+      }
+
+      // Build "Prop=Value, Prop=Value" from an axis-ordered property map
+      function comboName(combo, axisOrder) {
+        var parts = [];
+        for (var a = 0; a < axisOrder.length; a++) {
+          parts.push(axisOrder[a] + '=' + combo[axisOrder[a]]);
+        }
+        return parts.join(', ');
+      }
+
+      var variantNodes = [];
+
+      if (msg.baseComponentId) {
+        // ---- Mode A: generate variants from a base component ----
+        if (!msg.properties || Object.keys(msg.properties).length === 0) {
+          throw new Error('properties is required with baseComponentId. Example: { "State": ["default", "hover"], "Size": ["sm", "lg"] }');
+        }
+
+        var base = await figma.getNodeByIdAsync(msg.baseComponentId);
+        if (!base) throw new Error('Base component not found: ' + msg.baseComponentId + '. NodeIds are session-specific — re-search components to get fresh IDs.');
+        if (base.type !== 'COMPONENT') {
+          throw new Error('baseComponentId must be a COMPONENT node, got ' + base.type + '. To convert a frame, use figma_execute with figma.createComponentFromNode(frame) first.');
+        }
+        if (base.parent && base.parent.type === 'COMPONENT_SET') {
+          throw new Error('Base component is already a variant inside component set "' + base.parent.name + '". Use a standalone component.');
+        }
+
+        // Validate axes and build the cartesian product (last axis varies fastest,
+        // matching Figma's convention of State as the final property)
+        var axisOrder = [];
+        var axisValues = {};
+        for (var axis in msg.properties) {
+          if (msg.properties.hasOwnProperty(axis)) {
+            var vals = msg.properties[axis];
+            if (!vals || !vals.length) throw new Error('Property axis "' + axis + '" has no values');
+            var uniq = {};
+            for (var vv = 0; vv < vals.length; vv++) {
+              var sval = String(vals[vv]);
+              if (sval.indexOf('=') !== -1 || sval.indexOf(',') !== -1) {
+                throw new Error('Variant value "' + sval + '" (axis "' + axis + '") must not contain "=" or "," — Figma parses variant names on those characters');
+              }
+              if (uniq[sval]) throw new Error('Duplicate value "' + sval + '" in axis "' + axis + '"');
+              uniq[sval] = true;
+            }
+            if (axis.indexOf('=') !== -1 || axis.indexOf(',') !== -1) {
+              throw new Error('Property name "' + axis + '" must not contain "=" or ","');
+            }
+            axisOrder.push(axis);
+            axisValues[axis] = vals.map(String);
+          }
+        }
+
+        var combos = [{}];
+        for (var ai = 0; ai < axisOrder.length; ai++) {
+          var nextCombos = [];
+          var axisName = axisOrder[ai];
+          for (var ci = 0; ci < combos.length; ci++) {
+            for (var vi2 = 0; vi2 < axisValues[axisName].length; vi2++) {
+              var extended = {};
+              for (var k in combos[ci]) { if (combos[ci].hasOwnProperty(k)) extended[k] = combos[ci][k]; }
+              extended[axisName] = axisValues[axisName][vi2];
+              nextCombos.push(extended);
+            }
+          }
+          combos = nextCombos;
+        }
+
+        if (combos.length > MAX_VARIANTS) {
+          throw new Error('Requested ' + combos.length + ' variants — capped at ' + MAX_VARIANTS + '. Split into multiple sets or reduce axis values.');
+        }
+
+        // Base becomes the first combination; clones fill in the rest.
+        // Stack clones vertically so nothing overlaps even without autoArrange.
+        var baseX = base.x;
+        var baseY = base.y;
+        var stepY = Math.ceil(base.height) + 40;
+        originalBaseName = base.name;
+        renamedBase = base;
+        base.name = comboName(combos[0], axisOrder);
+        variantNodes.push(base);
+        for (var ci2 = 1; ci2 < combos.length; ci2++) {
+          var clone = base.clone();
+          clone.name = comboName(combos[ci2], axisOrder);
+          clone.x = baseX;
+          clone.y = baseY + ci2 * stepY;
+          createdClones.push(clone);
+          variantNodes.push(clone);
+        }
+      } else if (msg.componentIds && msg.componentIds.length) {
+        // ---- Mode B: combine existing components ----
+        if (msg.componentIds.length > MAX_VARIANTS) {
+          throw new Error('Requested ' + msg.componentIds.length + ' variants — capped at ' + MAX_VARIANTS + '.');
+        }
+        if (msg.variantProperties && msg.variantProperties.length !== msg.componentIds.length) {
+          throw new Error('variantProperties length (' + msg.variantProperties.length + ') must match componentIds length (' + msg.componentIds.length + ')');
+        }
+
+        for (var ni = 0; ni < msg.componentIds.length; ni++) {
+          var node = await figma.getNodeByIdAsync(msg.componentIds[ni]);
+          if (!node) throw new Error('Component not found: ' + msg.componentIds[ni] + '. NodeIds are session-specific — re-search components to get fresh IDs.');
+          if (node.type !== 'COMPONENT') {
+            throw new Error('Node ' + msg.componentIds[ni] + ' is a ' + node.type + ', not a COMPONENT. All componentIds must reference COMPONENT nodes.');
+          }
+          if (node.parent && node.parent.type === 'COMPONENT_SET') {
+            throw new Error('Component "' + node.name + '" (' + node.id + ') is already a variant in set "' + node.parent.name + '". Components can only belong to one set.');
+          }
+          if (msg.variantProperties) {
+            var props = msg.variantProperties[ni];
+            var propKeys = Object.keys(props);
+            if (!propKeys.length) throw new Error('variantProperties[' + ni + '] is empty — each entry needs at least one property (e.g. { "State": "hover" })');
+            // Same '='/',' validation as Mode A — a value like "hover,Size=lg"
+            // would silently create a bogus axis when Figma parses the name.
+            for (var pk = 0; pk < propKeys.length; pk++) {
+              var propName = propKeys[pk];
+              var propValue = String(props[propName]);
+              if (propName.indexOf('=') !== -1 || propName.indexOf(',') !== -1) {
+                throw new Error('Property name "' + propName + '" (variantProperties[' + ni + ']) must not contain "=" or "," — Figma parses variant names on those characters');
+              }
+              if (propValue.indexOf('=') !== -1 || propValue.indexOf(',') !== -1) {
+                throw new Error('Variant value "' + propValue + '" (property "' + propName + '", variantProperties[' + ni + ']) must not contain "=" or "," — Figma parses variant names on those characters');
+              }
+            }
+            // Record the rename so the rollback path can restore it.
+            renamedNodes.push({ node: node, originalName: node.name });
+            variantNodes.push(node);
+            node.name = comboName(props, propKeys);
+          } else {
+            variantNodes.push(node);
+            if (node.name.indexOf('=') === -1) {
+              setWarnings.push('Component "' + node.name + '" is not named "Prop=Value" — Figma will file it under "Property 1=' + node.name + '". Pass variantProperties to control naming.');
+            }
+          }
+        }
+
+        // Duplicate variant names create an invalid (conflicting) set — fail early
+        var nameSeen = {};
+        for (var dn = 0; dn < variantNodes.length; dn++) {
+          if (nameSeen[variantNodes[dn].name]) {
+            throw new Error('Two variants would have identical properties: "' + variantNodes[dn].name + '". Each variant needs a unique property combination.');
+          }
+          nameSeen[variantNodes[dn].name] = true;
+        }
+      } else {
+        throw new Error('Provide either baseComponentId + properties (generate variants) or componentIds (combine existing components).');
+      }
+
+      // Resolve the parent — combineAsVariants REQUIRES a parent, and the set is
+      // created inside it. Fall back to the current page.
+      var setParent = figma.currentPage;
+      if (msg.parentId) {
+        var requestedParent = await figma.getNodeByIdAsync(msg.parentId);
+        if (requestedParent && typeof requestedParent.appendChild === 'function' && requestedParent.type !== 'COMPONENT' && requestedParent.type !== 'COMPONENT_SET' && requestedParent.type !== 'INSTANCE') {
+          setParent = requestedParent;
+        } else {
+          setWarnings.push('parentId "' + msg.parentId + '" not found or cannot contain a component set; created on the current page instead');
+        }
+      }
+
+      // Housekeeping on failure happens in the outer catch (gated on
+      // !combineDone) — it restores Mode A clones/base AND Mode B renames.
+      var componentSet = figma.combineAsVariants(variantNodes, setParent);
+      combineDone = true;
+      if (msg.name) componentSet.name = msg.name;
+      if (msg.position) {
+        componentSet.x = msg.position.x || 0;
+        componentSet.y = msg.position.y || 0;
+      }
+
+      // componentPropertyDefinitions live on the SET (not the variants) —
+      // read them back so callers see the axes Figma actually derived.
+      var propertyDefinitions = {};
+      try {
+        var defs = componentSet.componentPropertyDefinitions;
+        for (var defName in defs) {
+          if (defs.hasOwnProperty(defName)) {
+            propertyDefinitions[defName] = {
+              type: defs[defName].type,
+              defaultValue: defs[defName].defaultValue,
+              variantOptions: defs[defName].variantOptions || []
+            };
+          }
+        }
+      } catch (defError) {
+        setWarnings.push('Could not read componentPropertyDefinitions: ' + (defError && defError.message ? defError.message : String(defError)));
+      }
+
+      var variantSummaries = [];
+      for (var vs = 0; vs < componentSet.children.length; vs++) {
+        var child = componentSet.children[vs];
+        if (child.type === 'COMPONENT') {
+          // Include each variant's key — instantiation uses VARIANT keys, not the set key
+          variantSummaries.push({ id: child.id, name: child.name, key: child.key });
+        }
+      }
+
+      figma.currentPage.selection = [componentSet];
+      figma.viewport.scrollAndZoomIntoView([componentSet]);
+
+      console.log('🌉 [Desktop Bridge] Component set created:', componentSet.id, 'with', variantSummaries.length, 'variants');
+
+      // Everything rides in `data` — ui.html's handleResult only forwards
+      // whitelisted top-level fields, and msg.data is on that whitelist.
+      figma.ui.postMessage({
+        type: 'CREATE_COMPONENT_SET_RESULT',
+        requestId: msg.requestId,
+        success: true,
+        data: {
+          componentSet: {
+            id: componentSet.id,
+            name: componentSet.name,
+            key: componentSet.key,
+            x: componentSet.x,
+            y: componentSet.y,
+            width: componentSet.width,
+            height: componentSet.height,
+            parentId: componentSet.parent ? componentSet.parent.id : null
+          },
+          variantCount: variantSummaries.length,
+          variants: variantSummaries,
+          propertyDefinitions: propertyDefinitions,
+          warnings: setWarnings.length ? setWarnings : undefined
+        }
+      });
+
+    } catch (error) {
+      var csErrorMsg = error && error.message ? error.message : String(error);
+      console.error('🌉 [Desktop Bridge] Create component set error:', csErrorMsg);
+      // Undo partial work unless the set was actually created (after
+      // combineAsVariants succeeds the clones/renames live inside the set —
+      // never touch them then).
+      try { if (!combineDone) rollbackComponentSetWork(); } catch (e) {}
+      figma.ui.postMessage({
+        type: 'CREATE_COMPONENT_SET_RESULT',
+        requestId: msg.requestId,
+        success: false,
+        error: csErrorMsg
       });
     }
   }
@@ -2181,14 +2727,25 @@ figma.ui.onmessage = async (msg) => {
         throw new Error('Cannot add properties to variant components. Add to the parent COMPONENT_SET instead.');
       }
 
-      // Build options if preferredValues provided
+      // Build options if preferredValues and/or description provided (SLOT supports both)
       var options = undefined;
-      if (msg.preferredValues) {
-        options = { preferredValues: msg.preferredValues };
+      if (msg.preferredValues || msg.description) {
+        options = {};
+        if (msg.preferredValues) options.preferredValues = msg.preferredValues;
+        if (msg.description) options.description = msg.description;
+      }
+
+      // SLOT properties do not support defaultValue — pass empty string.
+      // VARIANT properties REQUIRE a non-empty defaultValue (live-validated
+      // 2026-07-09: '' throws "Component property default value cannot be
+      // empty") — pass the caller's value through untouched.
+      var defaultValue = msg.defaultValue;
+      if (msg.propertyType === 'SLOT') {
+        defaultValue = '';
       }
 
       // Use msg.propertyType (not msg.type which is the message type 'ADD_COMPONENT_PROPERTY')
-      var propertyNameWithId = node.addComponentProperty(msg.propertyName, msg.propertyType, msg.defaultValue, options);
+      var propertyNameWithId = node.addComponentProperty(msg.propertyName, msg.propertyType, defaultValue, options);
 
       console.log('🌉 [Desktop Bridge] Property added:', propertyNameWithId);
 
@@ -2284,6 +2841,287 @@ figma.ui.onmessage = async (msg) => {
         requestId: msg.requestId,
         success: false,
         error: errorMsg
+      });
+    }
+  }
+
+  // ============================================================================
+  // SLOT OPERATIONS — Figma Slots open beta (SlotNode API)
+  // ============================================================================
+
+  // CREATE_SLOT — create a SlotNode inside a component via createSlot()
+  else if (msg.type === 'CREATE_SLOT') {
+    try {
+      console.log('🌉 [Desktop Bridge] Creating slot on component:', msg.nodeId);
+
+      var componentNode = await figma.getNodeByIdAsync(msg.nodeId);
+      if (!componentNode) {
+        throw new Error('Node not found: ' + msg.nodeId);
+      }
+      if (componentNode.type !== 'COMPONENT') {
+        throw new Error('Node must be a COMPONENT (standalone or a variant inside a COMPONENT_SET). Got: ' + componentNode.type + '. For a COMPONENT_SET, call this once per variant component.');
+      }
+      if (typeof componentNode.createSlot !== 'function') {
+        throw new Error('createSlot() is not available. Update Figma Desktop to a version with Slots support.');
+      }
+
+      // createSlot() takes no arguments (a name arg is ignored — live-validated
+      // 2026-07-09). Renaming the returned node renames the linked SLOT property
+      // key live (Slot#id → Name#id), so rename-after-create IS the naming API.
+      var newSlot = componentNode.createSlot();
+      if (msg.name) newSlot.name = msg.name;
+      if (msg.layoutMode && msg.layoutMode !== 'GRID') {
+        newSlot.layoutMode = msg.layoutMode;
+      } else if (msg.layoutMode === 'GRID') {
+        throw new Error('GRID layoutMode is not allowed on slot nodes');
+      }
+      if (msg.width !== undefined || msg.height !== undefined) {
+        newSlot.resize(
+          msg.width !== undefined ? msg.width : newSlot.width,
+          msg.height !== undefined ? msg.height : newSlot.height
+        );
+      }
+
+      var slotPropertyKey = null;
+      try {
+        if (newSlot.componentPropertyReferences && newSlot.componentPropertyReferences.slotContentId) {
+          slotPropertyKey = newSlot.componentPropertyReferences.slotContentId;
+        }
+      } catch (e) { /* ignore */ }
+
+      figma.ui.postMessage({
+        type: 'CREATE_SLOT_RESULT',
+        requestId: msg.requestId,
+        success: true,
+        slot: {
+          id: newSlot.id,
+          name: newSlot.name,
+          type: newSlot.type,
+          propertyKey: slotPropertyKey,
+          width: newSlot.width,
+          height: newSlot.height,
+          layoutMode: newSlot.layoutMode
+        }
+      });
+    } catch (error) {
+      var createSlotError = error && error.message ? error.message : String(error);
+      console.error('🌉 [Desktop Bridge] Create slot error:', createSlotError);
+      figma.ui.postMessage({
+        type: 'CREATE_SLOT_RESULT',
+        requestId: msg.requestId,
+        success: false,
+        error: createSlotError
+      });
+    }
+  }
+
+  // GET_SLOTS — list SlotNode children on a component or instance
+  else if (msg.type === 'GET_SLOTS') {
+    try {
+      console.log('🌉 [Desktop Bridge] Getting slots for node:', msg.nodeId);
+
+      var targetNode = await figma.getNodeByIdAsync(msg.nodeId);
+      if (!targetNode) {
+        throw new Error('Node not found: ' + msg.nodeId);
+      }
+      if (targetNode.type !== 'COMPONENT' && targetNode.type !== 'INSTANCE' && targetNode.type !== 'COMPONENT_SET') {
+        throw new Error('Node must be a COMPONENT, COMPONENT_SET, or INSTANCE. Got: ' + targetNode.type);
+      }
+
+      var slotsResult = [];
+      if (targetNode.type === 'COMPONENT_SET') {
+        // Aggregate slots from all variant components
+        for (var vi = 0; vi < targetNode.children.length; vi++) {
+          var variant = targetNode.children[vi];
+          if (variant.type !== 'COMPONENT') continue;
+          var variantSlots = serializeSlotsFromNode(variant);
+          for (var vsi = 0; vsi < variantSlots.length; vsi++) {
+            variantSlots[vsi].variantId = variant.id;
+            variantSlots[vsi].variantName = variant.name;
+          }
+          slotsResult = slotsResult.concat(variantSlots);
+        }
+      } else {
+        slotsResult = serializeSlotsFromNode(targetNode);
+      }
+
+      figma.ui.postMessage({
+        type: 'GET_SLOTS_RESULT',
+        requestId: msg.requestId,
+        success: true,
+        data: {
+          nodeId: targetNode.id,
+          nodeType: targetNode.type,
+          slots: slotsResult,
+          count: slotsResult.length
+        }
+      });
+    } catch (error) {
+      var getSlotsError = error && error.message ? error.message : String(error);
+      console.error('🌉 [Desktop Bridge] Get slots error:', getSlotsError);
+      figma.ui.postMessage({
+        type: 'GET_SLOTS_RESULT',
+        requestId: msg.requestId,
+        success: false,
+        error: getSlotsError
+      });
+    }
+  }
+
+  // APPEND_TO_SLOT — clone or move a node into a slot (instances only for content population)
+  else if (msg.type === 'APPEND_TO_SLOT') {
+    try {
+      console.log('🌉 [Desktop Bridge] Appending to slot');
+
+      var slotNode = await resolveSlotNode(msg);
+      var slotParent = slotNode.parent;
+      if (!slotParent) {
+        throw new Error('Slot has no parent');
+      }
+
+      // Prepare the content FIRST — validation failures must not leave the
+      // slot half-mutated (clearExisting used to run before source resolution,
+      // so a bad sourceNodeId emptied the slot and then errored).
+      var appendedNode;
+      if (msg.sourceNodeId) {
+        var sourceNode = await figma.getNodeByIdAsync(msg.sourceNodeId);
+        if (!sourceNode) {
+          throw new Error('Source node not found: ' + msg.sourceNodeId);
+        }
+        // Guard BEFORE cloning — a clone of a ComponentNode is itself a
+        // ComponentNode, and cloning first leaks an orphan main component.
+        if (sourceNode.type === 'COMPONENT') {
+          throw new Error('ComponentNodes cannot be appended directly to a slot. Create an instance with createInstance() or clone an existing instance instead.');
+        }
+        if (msg.clone !== false) {
+          appendedNode = sourceNode.clone();
+        } else {
+          appendedNode = sourceNode;
+        }
+      } else if (msg.nodeType) {
+        var slotProps = msg.properties || {};
+        switch (msg.nodeType) {
+          case 'RECTANGLE':
+            appendedNode = figma.createRectangle();
+            break;
+          case 'ELLIPSE':
+            appendedNode = figma.createEllipse();
+            break;
+          case 'FRAME':
+            appendedNode = figma.createFrame();
+            break;
+          case 'TEXT':
+            appendedNode = figma.createText();
+            await figma.loadFontAsync({ family: 'Inter', style: 'Regular' });
+            appendedNode.fontName = { family: 'Inter', style: 'Regular' };
+            // Coerce: schema allows string|number; characters requires string.
+            // Check !== undefined so 0 and "0" are honored.
+            if (slotProps.text !== undefined) appendedNode.characters = String(slotProps.text);
+            break;
+          case 'LINE':
+            appendedNode = figma.createLine();
+            break;
+          case 'POLYGON':
+            appendedNode = figma.createPolygon();
+            break;
+          case 'STAR':
+            appendedNode = figma.createStar();
+            break;
+          case 'VECTOR':
+            appendedNode = figma.createVector();
+            break;
+          default:
+            throw new Error('Unsupported node type for slot content: ' + msg.nodeType);
+        }
+        if (slotProps.name) appendedNode.name = String(slotProps.name);
+        // Coerce to numbers and allow width-only / height-only resizes.
+        if (slotProps.width !== undefined || slotProps.height !== undefined) {
+          var rw = slotProps.width !== undefined ? Number(slotProps.width) : appendedNode.width;
+          var rh = slotProps.height !== undefined ? Number(slotProps.height) : appendedNode.height;
+          if (!isNaN(rw) && !isNaN(rh)) appendedNode.resize(rw, rh);
+        }
+      } else {
+        throw new Error('Provide sourceNodeId (to clone/move into slot) or nodeType (to create new content in slot)');
+      }
+
+      // Content is ready — NOW it is safe to clear existing children.
+      if (msg.clearExisting) {
+        var existingChildren = [];
+        try {
+          for (var ei = 0; ei < slotNode.children.length; ei++) {
+            existingChildren.push(slotNode.children[ei]);
+          }
+        } catch (e) { /* ignore */ }
+        for (var er = 0; er < existingChildren.length; er++) {
+          existingChildren[er].remove();
+        }
+      }
+
+      slotNode.appendChild(appendedNode);
+
+      // Cloned nodes keep their original x/y, which can land them outside the
+      // slot's visible bounds (live-validated: a clone from elsewhere on the
+      // page rendered invisible inside a 100×100 slot). In auto-layout slots
+      // Figma manages position; in NONE layout, snap to the slot origin.
+      if (slotNode.layoutMode === 'NONE' || !slotNode.layoutMode) {
+        try { appendedNode.x = 0; appendedNode.y = 0; } catch (e) { /* locked/readonly — leave as-is */ }
+      }
+
+      figma.ui.postMessage({
+        type: 'APPEND_TO_SLOT_RESULT',
+        requestId: msg.requestId,
+        success: true,
+        slot: { id: slotNode.id, name: slotNode.name },
+        appendedNode: {
+          id: appendedNode.id,
+          name: appendedNode.name,
+          type: appendedNode.type,
+          width: appendedNode.width,
+          height: appendedNode.height
+        }
+      });
+    } catch (error) {
+      var appendSlotError = error && error.message ? error.message : String(error);
+      console.error('🌉 [Desktop Bridge] Append to slot error:', appendSlotError);
+      figma.ui.postMessage({
+        type: 'APPEND_TO_SLOT_RESULT',
+        requestId: msg.requestId,
+        success: false,
+        error: appendSlotError
+      });
+    }
+  }
+
+  // RESET_SLOT — revert instance slot content to component default
+  else if (msg.type === 'RESET_SLOT') {
+    try {
+      console.log('🌉 [Desktop Bridge] Resetting slot');
+
+      var resetSlotNode = await resolveSlotNode(msg);
+      if (typeof resetSlotNode.resetSlot !== 'function') {
+        throw new Error('resetSlot() is not available on this node. Ensure Figma Desktop supports Slots (open beta).');
+      }
+
+      resetSlotNode.resetSlot();
+
+      figma.ui.postMessage({
+        type: 'RESET_SLOT_RESULT',
+        requestId: msg.requestId,
+        success: true,
+        slot: {
+          id: resetSlotNode.id,
+          name: resetSlotNode.name,
+          childCount: resetSlotNode.children ? resetSlotNode.children.length : 0
+        }
+      });
+    } catch (error) {
+      var resetSlotError = error && error.message ? error.message : String(error);
+      console.error('🌉 [Desktop Bridge] Reset slot error:', resetSlotError);
+      figma.ui.postMessage({
+        type: 'RESET_SLOT_RESULT',
+        requestId: msg.requestId,
+        success: false,
+        error: resetSlotError
       });
     }
   }
@@ -2387,19 +3225,32 @@ figma.ui.onmessage = async (msg) => {
         throw new Error('Node type ' + node.type + ' does not support fills');
       }
 
-      // Process fills - convert hex colors if needed
-      var processedFills = msg.fills.map(function(fill) {
-        if (fill.type === 'SOLID' && typeof fill.color === 'string') {
-          // Convert hex to RGB
-          var rgb = hexToFigmaRGB(fill.color);
-          return {
+      // Process fills - convert hex colors, and optionally bind a color variable.
+      // Color variables bind at the PAINT level (not the node level), so we build
+      // the solid paint then attach the binding via setBoundVariableForPaint.
+      var processedFills = [];
+      for (var fi = 0; fi < msg.fills.length; fi++) {
+        var fill = msg.fills[fi];
+        if (fill.type === 'SOLID') {
+          var baseHex = typeof fill.color === 'string' ? fill.color : '#000000';
+          var rgb = hexToFigmaRGB(baseHex);
+          var paint = {
             type: 'SOLID',
             color: { r: rgb.r, g: rgb.g, b: rgb.b },
             opacity: rgb.a !== undefined ? rgb.a : (fill.opacity !== undefined ? fill.opacity : 1)
           };
+          if (fill.variableId) {
+            var fillVar = await figma.variables.getVariableByIdAsync(fill.variableId);
+            if (!fillVar) {
+              throw new Error('Fill variable not found: "' + fill.variableId + '". Pass a local variable id from figma_get_variables (e.g. "VariableID:1:23"). Library variables must be imported first via figma_import_library_variable.');
+            }
+            paint = figma.variables.setBoundVariableForPaint(paint, 'color', fillVar);
+          }
+          processedFills.push(paint);
+        } else {
+          processedFills.push(fill);
         }
-        return fill;
-      });
+      }
 
       node.fills = processedFills;
 
@@ -2449,14 +3300,23 @@ figma.ui.onmessage = async (msg) => {
       var nodeIds = msg.nodeIds || (msg.nodeId ? [msg.nodeId] : []);
       var updatedCount = 0;
       var updatedNodes = [];
+      var skipWarnings = [];
 
       for (var i = 0; i < nodeIds.length; i++) {
         var node = await figma.getNodeByIdAsync(nodeIds[i]);
-        if (node && 'fills' in node) {
+        if (!node) {
+          skipWarnings.push('node "' + nodeIds[i] + '" not found');
+        } else if (!('fills' in node)) {
+          skipWarnings.push('node "' + nodeIds[i] + '" (' + node.type + ') does not support fills');
+        } else {
           node.fills = [fill];
           updatedCount++;
           updatedNodes.push({ id: node.id, name: node.name });
         }
+      }
+
+      if (updatedCount === 0 && nodeIds.length > 0) {
+        throw new Error('Image fill applied to 0 node(s): ' + skipWarnings.join('; '));
       }
 
       console.log('🌉 [Desktop Bridge] Image fill applied to', updatedCount, 'node(s), hash:', imageHash);
@@ -2467,7 +3327,8 @@ figma.ui.onmessage = async (msg) => {
         success: true,
         imageHash: imageHash,
         updatedCount: updatedCount,
-        nodes: updatedNodes
+        nodes: updatedNodes,
+        warnings: skipWarnings.length ? skipWarnings : undefined
       });
 
     } catch (error) {
@@ -2498,18 +3359,31 @@ figma.ui.onmessage = async (msg) => {
         throw new Error('Node type ' + node.type + ' does not support strokes');
       }
 
-      // Process strokes - convert hex colors if needed
-      var processedStrokes = msg.strokes.map(function(stroke) {
-        if (stroke.type === 'SOLID' && typeof stroke.color === 'string') {
-          var rgb = hexToFigmaRGB(stroke.color);
-          return {
+      // Process strokes - convert hex colors, and optionally bind a color variable
+      // (paint-level binding, same as fills).
+      var processedStrokes = [];
+      for (var sti = 0; sti < msg.strokes.length; sti++) {
+        var stroke = msg.strokes[sti];
+        if (stroke.type === 'SOLID') {
+          var sBaseHex = typeof stroke.color === 'string' ? stroke.color : '#000000';
+          var srgb = hexToFigmaRGB(sBaseHex);
+          var spaint = {
             type: 'SOLID',
-            color: { r: rgb.r, g: rgb.g, b: rgb.b },
-            opacity: rgb.a !== undefined ? rgb.a : (stroke.opacity !== undefined ? stroke.opacity : 1)
+            color: { r: srgb.r, g: srgb.g, b: srgb.b },
+            opacity: srgb.a !== undefined ? srgb.a : (stroke.opacity !== undefined ? stroke.opacity : 1)
           };
+          if (stroke.variableId) {
+            var strokeVar = await figma.variables.getVariableByIdAsync(stroke.variableId);
+            if (!strokeVar) {
+              throw new Error('Stroke variable not found: "' + stroke.variableId + '". Pass a local variable id from figma_get_variables. Library variables must be imported first via figma_import_library_variable.');
+            }
+            spaint = figma.variables.setBoundVariableForPaint(spaint, 'color', strokeVar);
+          }
+          processedStrokes.push(spaint);
+        } else {
+          processedStrokes.push(stroke);
         }
-        return stroke;
-      });
+      }
 
       node.strokes = processedStrokes;
 
@@ -2744,10 +3618,25 @@ figma.ui.onmessage = async (msg) => {
         throw new Error('Node must be a TEXT node. Got: ' + node.type);
       }
 
-      // Load the font first
-      await figma.loadFontAsync(node.fontName);
-
-      node.characters = msg.text;
+      // Load the font(s) first — mutating text in dynamic-page mode requires it.
+      // If the caller requested a new family/style, load that (tolerating
+      // "SemiBold" vs "Semi Bold"); otherwise load the node's existing font(s),
+      // which also handles mixed-font nodes that the old single loadFontAsync
+      // call would have crashed on.
+      if (msg.fontFamily || msg.fontStyle) {
+        var currentFont = (node.fontName && node.fontName !== figma.mixed)
+          ? node.fontName
+          : { family: 'Inter', style: 'Regular' };
+        var targetFamily = msg.fontFamily || currentFont.family;
+        var targetStyle = msg.fontStyle || currentFont.style;
+        await loadFontsForNode(node); // existing runs, so setting characters is safe
+        var loadedFont = await loadFontWithFallback(targetFamily, targetStyle);
+        node.characters = msg.text;
+        node.fontName = loadedFont;
+      } else {
+        await loadFontsForNode(node);
+        node.characters = msg.text;
+      }
 
       // Apply font properties if specified
       if (msg.fontSize) {
@@ -2833,8 +3722,10 @@ figma.ui.onmessage = async (msg) => {
       if (props.name) newNode.name = props.name;
       if (props.x !== undefined) newNode.x = props.x;
       if (props.y !== undefined) newNode.y = props.y;
-      if (props.width !== undefined && props.height !== undefined) {
-        newNode.resize(props.width, props.height);
+      if (props.width !== undefined || props.height !== undefined) {
+        var resizeWidth = props.width !== undefined ? props.width : newNode.width;
+        var resizeHeight = props.height !== undefined ? props.height : newNode.height;
+        newNode.resize(resizeWidth, resizeHeight);
       }
 
       // Apply fills if specified
@@ -2903,9 +3794,107 @@ figma.ui.onmessage = async (msg) => {
         throw new Error('Node type ' + node.type + ' does not support export');
       }
 
-      // Configure export settings
+      // Configure export settings — AI-optimized defaults (PNG 1x)
       var format = msg.format || 'PNG';
-      var scale = msg.scale || 2;
+      var scale = msg.scale || 1;
+
+      // AI vision cap: Claude API resizes images to 1568px on the longest side
+      // before processing, so exporting larger just wastes bandwidth and tokens.
+      var AI_MAX_DIMENSION = 1568;
+      var nodeWidth = 0;
+      var nodeHeight = 0;
+
+      if (node.type === 'PAGE') {
+        // Pages don't have fixed dimensions — calculate from visible children
+        var minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+        for (var i = 0; i < node.children.length; i++) {
+          var child = node.children[i];
+          if (child.visible !== false && 'absoluteBoundingBox' in child && child.absoluteBoundingBox) {
+            var bb = child.absoluteBoundingBox;
+            minX = Math.min(minX, bb.x);
+            minY = Math.min(minY, bb.y);
+            maxX = Math.max(maxX, bb.x + bb.width);
+            maxY = Math.max(maxY, bb.y + bb.height);
+          }
+        }
+        if (minX !== Infinity) {
+          nodeWidth = maxX - minX;
+          nodeHeight = maxY - minY;
+        }
+      } else if ('width' in node && 'height' in node) {
+        nodeWidth = node.width;
+        nodeHeight = node.height;
+      }
+
+      // Cap scale so the longest exported side doesn't exceed the AI processing ceiling
+      if (nodeWidth > 0 && nodeHeight > 0) {
+        var longestSide = Math.max(nodeWidth, nodeHeight);
+        var exportedLongest = longestSide * scale;
+        if (exportedLongest > AI_MAX_DIMENSION) {
+          var cappedScale = AI_MAX_DIMENSION / longestSide;
+          console.log('🌉 [Desktop Bridge] Capping scale from', scale, 'to', cappedScale.toFixed(3),
+            '(node ' + Math.round(longestSide) + 'px, cap ' + AI_MAX_DIMENSION + 'px)');
+          scale = cappedScale;
+        }
+      }
+
+      // Analyze node content to recommend optimal format
+      var imageCount = 0;
+      var gradientCount = 0;
+      var textCount = 0;
+      var vectorCount = 0;
+      var maxDepth = 3; // Don't recurse too deep — top-level composition is enough
+
+      function analyzeContent(n, depth) {
+        if (depth > maxDepth) return;
+        if (n.type === 'TEXT') { textCount++; return; }
+        if (n.type === 'VECTOR' || n.type === 'LINE' || n.type === 'STAR' ||
+            n.type === 'POLYGON' || n.type === 'ELLIPSE' || n.type === 'BOOLEAN_OPERATION') {
+          vectorCount++; return;
+        }
+        // Check fills for images and gradients
+        if ('fills' in n && Array.isArray(n.fills)) {
+          for (var f = 0; f < n.fills.length; f++) {
+            var fill = n.fills[f];
+            if (fill.visible === false) continue;
+            if (fill.type === 'IMAGE') imageCount++;
+            if (fill.type === 'GRADIENT_LINEAR' || fill.type === 'GRADIENT_RADIAL' ||
+                fill.type === 'GRADIENT_ANGULAR' || fill.type === 'GRADIENT_DIAMOND') gradientCount++;
+          }
+        }
+        // Recurse into children
+        if ('children' in n) {
+          for (var c = 0; c < n.children.length; c++) {
+            if (n.children[c].visible !== false) {
+              analyzeContent(n.children[c], depth + 1);
+            }
+          }
+        }
+      }
+      analyzeContent(node, 0);
+
+      var totalElements = imageCount + gradientCount + textCount + vectorCount;
+      var photoHeavy = totalElements > 0 && (imageCount + gradientCount) / totalElements > 0.5;
+      var adviceParts = [];
+
+      // Format advice
+      if (photoHeavy) {
+        adviceParts.push('Image/gradient-heavy content — try format: "JPG" for smaller file.');
+      }
+
+      // Scale capping advice
+      if (scale < (msg.scale || 1)) {
+        adviceParts.push('Scale capped from ' + (msg.scale || 1) + 'x to ' +
+          scale.toFixed(2) + 'x (AI vision max: 1568px).');
+      }
+
+      // Scope advice for full-page captures with heavy downscaling
+      if (node.type === 'PAGE' && scale < 0.5) {
+        adviceParts.push('Full-page capture at ' + scale.toFixed(2) +
+          'x — text may be unreadable. Pass a nodeId to target a specific frame or component.');
+      }
+
+      var formatAdvice = adviceParts.join(' ');
 
       var exportSettings = {
         format: format,
@@ -2924,7 +3913,7 @@ figma.ui.onmessage = async (msg) => {
         bounds = node.absoluteBoundingBox;
       }
 
-      console.log('🌉 [Desktop Bridge] Screenshot captured:', bytes.length, 'bytes');
+      console.log('🌉 [Desktop Bridge] Screenshot captured:', bytes.length, 'bytes (' + format + ' @ ' + scale.toFixed(2) + 'x)');
 
       figma.ui.postMessage({
         type: 'CAPTURE_SCREENSHOT_RESULT',
@@ -2940,7 +3929,8 @@ figma.ui.onmessage = async (msg) => {
             name: node.name,
             type: node.type
           },
-          bounds: bounds
+          bounds: bounds,
+          formatAdvice: formatAdvice
         }
       });
 
@@ -3017,7 +4007,7 @@ figma.ui.onmessage = async (msg) => {
       });
       // Short delay to let the response message be sent before reload
       setTimeout(function() {
-        figma.showUI(__html__, { width: 140, height: 50, visible: true, themeColors: true });
+        figma.showUI(__html__, { width: 240, height: 40, visible: true, themeColors: true });
       }, 100);
     } catch (error) {
       var errorMsg = error && error.message ? error.message : String(error);
@@ -3059,35 +4049,34 @@ figma.ui.onmessage = async (msg) => {
       // VARIANT properties use just "PropertyName"
       var propsToSet = {};
       var propUpdates = msg.properties || {};
+      var propWarnings = [];
+      var hasTextProp = false;
 
       for (var propName in propUpdates) {
+        if (!propUpdates.hasOwnProperty(propName)) continue;
         var newValue = propUpdates[propName];
+        var resolvedName = resolvePropertyName(currentProps, propName);
 
-        // Check if this exact property name exists
-        if (currentProps[propName] !== undefined) {
-          propsToSet[propName] = newValue;
-          console.log('🌉 [Desktop Bridge] Setting property:', propName, '=', newValue);
+        if (resolvedName !== null) {
+          propsToSet[resolvedName] = newValue;
+          if (currentProps[resolvedName] && currentProps[resolvedName].type === 'TEXT') {
+            hasTextProp = true;
+          }
+          console.log('🌉 [Desktop Bridge] Setting property:', resolvedName, '=', newValue);
         } else {
-          // Try to find a matching property with a suffix (for TEXT/BOOLEAN/INSTANCE_SWAP)
-          var foundMatch = false;
-          for (var existingProp in currentProps) {
-            // Check if this is the base property name with a node ID suffix
-            if (existingProp.startsWith(propName + '#')) {
-              propsToSet[existingProp] = newValue;
-              console.log('🌉 [Desktop Bridge] Found suffixed property:', existingProp, '=', newValue);
-              foundMatch = true;
-              break;
-            }
-          }
-
-          if (!foundMatch) {
-            console.warn('🌉 [Desktop Bridge] Property not found:', propName, '- Available:', Object.keys(currentProps).join(', '));
-          }
+          console.warn('🌉 [Desktop Bridge] Property not found:', propName, '- Available:', Object.keys(currentProps).join(', '));
+          propWarnings.push('property "' + propName + '" not found; available: ' + Object.keys(currentProps).join(', '));
         }
       }
 
       if (Object.keys(propsToSet).length === 0) {
         throw new Error('No valid properties to set. Available properties: ' + Object.keys(currentProps).join(', '));
+      }
+
+      // Pre-load fonts before applying TEXT-property values. Mutating text
+      // content in dynamic-page mode throws unless fonts are already loaded.
+      if (hasTextProp) {
+        await loadFontsForNode(node);
       }
 
       // Apply the properties
@@ -3114,7 +4103,8 @@ figma.ui.onmessage = async (msg) => {
             };
             return acc;
           }, {})
-        }
+        },
+        warnings: propWarnings.length ? propWarnings : undefined
       });
 
     } catch (error) {
@@ -3199,25 +4189,84 @@ figma.ui.onmessage = async (msg) => {
         return false;
       }
 
+      // Line/paragraph SPACING only affects readability when text actually renders on
+      // 2+ lines (or 2+ paragraphs). Single-line labels, buttons, inputs and headings
+      // gain nothing from a 1.5 line height, so flagging them is false-positive noise.
+      // (WCAG 1.4.12 conformance is a code concern — whether spacing overrides break
+      // layout — not something a design's spacing value can prove. These stay best-practice.)
+      function textRendersMultipleLines(node, effectiveLh) {
+        try {
+          var chars = (typeof node.characters === 'string') ? node.characters : '';
+          // \n = paragraph break; U+2028 = line break (shift-enter) within a Figma paragraph
+          var LINE_SEP = String.fromCharCode(0x2028);
+          if (chars.indexOf(String.fromCharCode(10)) !== -1 || chars.indexOf(LINE_SEP) !== -1) return true;
+          // WIDTH_AND_HEIGHT auto-resize grows horizontally and never wraps on its own
+          if (node.textAutoResize === 'WIDTH_AND_HEIGHT') return false;
+          if (effectiveLh && typeof node.height === 'number' && node.height > 0) {
+            return (node.height / effectiveLh) >= 1.6; // ≈ 2+ rendered lines
+          }
+        } catch (e) { /* mixed/slot — treat as single line */ }
+        return false;
+      }
+
+      function textHasMultipleParagraphs(node) {
+        try {
+          var chars = (typeof node.characters === 'string') ? node.characters : '';
+          return chars.indexOf('\n') !== -1; // \n = paragraph separator in Figma text
+        } catch (e) { /* ignore */ }
+        return false;
+      }
+
       // ---- Rule configuration ----
       var allRuleIds = [
         'wcag-contrast', 'wcag-text-size', 'wcag-target-size', 'wcag-line-height',
+        'wcag-non-text-contrast', 'wcag-color-only', 'wcag-focus-indicator',
+        'wcag-letter-spacing', 'wcag-paragraph-spacing', 'wcag-image-alt',
+        'wcag-heading-hierarchy', 'wcag-reflow', 'wcag-reading-order',
+        'wcag-disabled-no-context', 'token-misuse',
         'hardcoded-color', 'no-text-style', 'default-name', 'detached-component',
         'no-autolayout', 'empty-container'
       ];
 
       var ruleGroups = {
         'all': allRuleIds,
-        'wcag': ['wcag-contrast', 'wcag-text-size', 'wcag-target-size', 'wcag-line-height'],
-        'design-system': ['hardcoded-color', 'no-text-style', 'default-name', 'detached-component'],
+        // 'wcag' = genuine WCAG conformance criteria only. Readability "best practice"
+        // checks (text size, line/letter/paragraph spacing) live in 'best-practice' so a
+        // conformance audit (rules: ['wcag']) is not polluted by non-normative hints.
+        // In particular, WCAG 1.4.12 Text Spacing is a "support user overrides without
+        // breaking" criterion — NOT a requirement to ship specific spacing values — so a
+        // sub-1.5 line height is not a conformance failure (see 'best-practice' below).
+        'wcag': [
+          'wcag-contrast', 'wcag-target-size',
+          'wcag-non-text-contrast', 'wcag-color-only', 'wcag-focus-indicator',
+          'wcag-image-alt', 'wcag-heading-hierarchy', 'wcag-reflow', 'wcag-reading-order',
+          'wcag-disabled-no-context'
+        ],
+        // Readability best practices — useful hints, NOT WCAG conformance failures.
+        // Opt in with rules: ['best-practice'] (or ['all']); excluded from the default set.
+        'best-practice': [
+          'wcag-text-size', 'wcag-line-height', 'wcag-letter-spacing', 'wcag-paragraph-spacing'
+        ],
+        'design-system': ['hardcoded-color', 'no-text-style', 'default-name', 'detached-component', 'token-misuse'],
         'layout': ['no-autolayout', 'empty-container']
       };
 
       var severityMap = {
         'wcag-contrast': 'critical',
         'wcag-target-size': 'critical',
+        'wcag-non-text-contrast': 'critical',
+        'wcag-color-only': 'critical',
+        'wcag-focus-indicator': 'critical',
         'wcag-text-size': 'warning',
-        'wcag-line-height': 'warning',
+        'wcag-letter-spacing': 'warning',
+        'wcag-image-alt': 'warning',
+        'wcag-heading-hierarchy': 'warning',
+        'wcag-reflow': 'warning',
+        'wcag-reading-order': 'warning',
+        'wcag-disabled-no-context': 'warning',
+        'wcag-line-height': 'info',
+        'wcag-paragraph-spacing': 'info',
+        'token-misuse': 'warning',
         'hardcoded-color': 'warning',
         'no-text-style': 'warning',
         'default-name': 'warning',
@@ -3226,11 +4275,47 @@ figma.ui.onmessage = async (msg) => {
         'empty-container': 'info'
       };
 
+      // WCAG conformance level per rule — lets teams filter by target level (AA vs AAA)
+      var wcagLevelMap = {
+        'wcag-contrast': 'aa',           // 1.4.3 Contrast (Minimum) — Level AA
+        'wcag-target-size': 'aa',        // 2.5.8 Target Size (Minimum) — Level AA
+        'wcag-non-text-contrast': 'aa',  // 1.4.11 Non-text Contrast — Level AA
+        'wcag-color-only': 'a',          // 1.4.1 Use of Color — Level A
+        'wcag-focus-indicator': 'aa',    // 2.4.7 Focus Visible — Level AA
+        'wcag-text-size': 'best-practice', // Not actually 1.4.4; 12px minimum is a readability best practice
+        'wcag-line-height': 'best-practice', // 1.4.12 is about supporting user overrides, not requiring specific values
+        'wcag-letter-spacing': 'best-practice', // Negative spacing actively harms readability
+        'wcag-paragraph-spacing': 'best-practice', // 1.4.12 is about supporting user overrides
+        'wcag-image-alt': 'a',           // 1.1.1 Non-text Content — Level A
+        'wcag-heading-hierarchy': 'a',   // 1.3.1 Info and Relationships — Level A
+        'wcag-reflow': 'aa',            // 1.4.10 Reflow — Level AA
+        'wcag-reading-order': 'a',       // 1.3.2 Meaningful Sequence — Level A
+        'wcag-disabled-no-context': 'aa', // 4.1.2 Name, Role, Value — disabled elements need ARIA context
+        'token-misuse': 'design-system',
+        'hardcoded-color': 'design-system',
+        'no-text-style': 'design-system',
+        'default-name': 'design-system',
+        'detached-component': 'design-system',
+        'no-autolayout': 'design-system',
+        'empty-container': 'design-system'
+      };
+
       var ruleDescriptions = {
-        'wcag-contrast': 'Text does not meet WCAG AA contrast ratio (4.5:1 normal, 3:1 large)',
-        'wcag-text-size': 'Text size is below 12px minimum',
-        'wcag-target-size': 'Interactive element is smaller than 24x24px minimum target size',
-        'wcag-line-height': 'Line height is less than 1.5x the font size',
+        'wcag-contrast': 'Text does not meet WCAG AA contrast ratio (4.5:1 normal, 3:1 large text ≥24px or ≥18.5px bold). Best practice: always target 4.5:1, especially in dark mode.',
+        'wcag-text-size': 'Text size is below 12px — readability best practice. Note: WCAG 1.4.4 requires supporting 200% text-only zoom (use rem/em units), not a specific minimum size.',
+        'wcag-target-size': 'Interactive element is smaller than 24x24px minimum target size (WCAG 2.5.8)',
+        'wcag-line-height': 'Multi-line body text has line height below 1.5x font size — a readability best practice (only flagged on text that wraps to 2+ lines; single-line labels, buttons and headings are exempt). NOT a WCAG failure: 1.4.12 requires content to survive a user overriding line height to 1.5x without loss of content, which is verified in code, not by the default value in the design.',
+        'wcag-non-text-contrast': 'UI component or graphical object does not meet 3:1 contrast ratio against adjacent color. Also applies to borders and chart elements against adjacent elements (WCAG 1.4.11)',
+        'wcag-color-only': 'Information is conveyed only through color change (e.g., error state uses red border without an error message or icon). Color can supplement but must not be the sole indicator (WCAG 1.4.1)',
+        'wcag-focus-indicator': 'Interactive component is missing a focus/focused variant or the focus indicator is insufficient. A visible focus state is critical — without it, keyboard users cannot navigate the interface (WCAG 2.4.7)',
+        'wcag-letter-spacing': 'Negative letter spacing (tighter than default) harms readability — a best-practice hint, not a WCAG failure. WCAG 1.4.12 is about supporting user-overridden spacing without loss of content (verified in code), not the default tracking in the design.',
+        'wcag-paragraph-spacing': 'Multi-paragraph text has paragraph spacing below 2x font size — a readability best practice (only flagged when a text node has 2+ paragraphs). NOT a WCAG failure: 1.4.12 requires content to survive a user overriding paragraph spacing to 2x without loss of content, verified in code, not by the default value in the design.',
+        'wcag-image-alt': 'Image or image fill has no description annotation for alternative text. All images need alt text; decorative images should be explicitly marked as decorative. Graphs and charts also need long descriptions (e.g., a data table) (WCAG 1.1.1)',
+        'wcag-heading-hierarchy': 'Heading levels skip a level (e.g., H1 followed by H3). Use H1 through H6 sequentially without skipping levels (WCAG 1.3.1)',
+        'wcag-reflow': 'Frame uses fixed positioning without auto-layout. Content must support 400% zoom on 1280px viewport (equivalent to 320px minimum width) without horizontal scrolling or loss of content (WCAG 1.4.10)',
+        'wcag-reading-order': 'Visual position of elements does not match layer order. Keyboard navigation and screen reader order must follow a logical sequence (WCAG 1.3.2)',
+        'wcag-disabled-no-context': 'Disabled variant has no tooltip, helper text, or annotation explaining why the element is disabled. Use aria-disabled (not HTML disabled) to keep the element focusable for screen readers, and add a tooltip so all users understand the disabled reason.',
+        'token-misuse': 'Variable name prefix does not match its usage context (e.g., a bg/* token used as a text fill, or a text/* token used as a background). This may cause contrast issues and indicates a misbound token.',
         'hardcoded-color': 'Fill color is not bound to a variable or style',
         'no-text-style': 'Text node is not using a text style',
         'default-name': 'Node has a default Figma name (e.g., "Frame 1")',
@@ -3242,8 +4327,100 @@ figma.ui.onmessage = async (msg) => {
       var defaultNameRegex = /^(Frame|Rectangle|Ellipse|Line|Text|Group|Component|Instance|Vector|Polygon|Star|Section)(\s+\d+)?$/;
       var interactiveNameRegex = /button|link|input|checkbox|radio|switch|toggle|tab|menu-item/i;
 
+      // ---- Additional helpers for new WCAG rules ----
+
+      // Get the first visible solid fill color from a node (for non-text contrast)
+      function lintGetNodeFillColor(node) {
+        try {
+          var fills = node.fills;
+          if (fills && fills.length > 0) {
+            for (var i = fills.length - 1; i >= 0; i--) {
+              if (fills[i].type === 'SOLID' && fills[i].visible !== false) {
+                return { r: fills[i].color.r, g: fills[i].color.g, b: fills[i].color.b };
+              }
+            }
+          }
+        } catch (e) { /* slot sublayer */ }
+        return null;
+      }
+
+      // Get the first visible solid stroke color from a node
+      function lintGetNodeStrokeColor(node) {
+        try {
+          var strokes = node.strokes;
+          if (strokes && strokes.length > 0) {
+            for (var i = strokes.length - 1; i >= 0; i--) {
+              if (strokes[i].type === 'SOLID' && strokes[i].visible !== false) {
+                return { r: strokes[i].color.r, g: strokes[i].color.g, b: strokes[i].color.b };
+              }
+            }
+          }
+        } catch (e) { /* slot sublayer */ }
+        return null;
+      }
+
+      // Check if a node has any non-color visual differentiation (icon children, text change, border)
+      function lintHasNonColorIndicator(node) {
+        try {
+          if (!node.children) return false;
+          for (var i = 0; i < node.children.length; i++) {
+            var child = node.children[i];
+            try {
+              // Icons are typically vectors, instances, or small frames with vector children
+              if (child.type === 'VECTOR' || child.type === 'BOOLEAN_OPERATION') return true;
+              if (child.type === 'INSTANCE') return true;
+              // Check for visible strokes (borders)
+              if (child.strokes && child.strokes.length > 0) {
+                for (var si = 0; si < child.strokes.length; si++) {
+                  if (child.strokes[si].visible !== false) return true;
+                }
+              }
+            } catch (e) { /* skip */ }
+          }
+        } catch (e) { /* no children */ }
+        return false;
+      }
+
+      // Heading level detection from text style name or font size
+      var headingStyleRegex = /\bh(\d)\b|heading[\s-]*(\d)/i;
+      function lintGetHeadingLevel(node) {
+        // Try text style name first
+        try {
+          if (node.textStyleId && typeof node.textStyleId === 'string') {
+            // We can't resolve style name in plugin sandbox directly from ID alone,
+            // but we check the node name and font size as fallback
+          }
+        } catch (e) { /* skip */ }
+        // Check node name for heading patterns
+        try {
+          var match = headingStyleRegex.exec(node.name);
+          if (match) return parseInt(match[1] || match[2], 10);
+        } catch (e) { /* skip */ }
+        // Infer from font size (common convention)
+        try {
+          var fs = node.fontSize;
+          if (typeof fs === 'number') {
+            if (fs >= 40) return 1;
+            if (fs >= 32) return 2;
+            if (fs >= 24) return 3;
+            if (fs >= 20) return 4;
+            if (fs >= 18) return 5;
+          }
+        } catch (e) { /* mixed */ }
+        return 0; // Not a heading
+      }
+
+      // Tracking for heading hierarchy check (reset per root scan)
+      var headingSequence = [];
+
+      // Tracking for reading order check — collect positioned children per parent
+      // (checked after tree walk per-frame)
+
       // ---- Resolve active rules ----
-      var requestedRules = msg.rules || ['all'];
+      // Default audit = real WCAG conformance + design-system + layout. Best-practice
+      // readability hints are opt-in (rules: ['best-practice'] or ['all']) so component
+      // library audits aren't flooded with non-normative spacing/size noise.
+      var requestedRules = msg.rules || ['wcag', 'design-system', 'layout'];
       var activeRuleSet = {};
       for (var ri = 0; ri < requestedRules.length; ri++) {
         var ruleOrGroup = requestedRules[ri];
@@ -3430,7 +4607,7 @@ figma.ui.onmessage = async (msg) => {
                 effectiveLh = fs * (lh.value / 100);
               }
             }
-            if (effectiveLh !== null && effectiveLh < 1.5 * fs) {
+            if (effectiveLh !== null && effectiveLh < 1.5 * fs && textRendersMultipleLines(node, effectiveLh)) {
               if (totalFindings < maxFindings) {
                 findings['wcag-line-height'].push({
                   id: nodeId,
@@ -3447,7 +4624,479 @@ figma.ui.onmessage = async (msg) => {
           } catch (e) { /* slot sublayer or mixed */ }
         }
 
+        // wcag-non-text-contrast: UI components need 3:1 against adjacent color (WCAG 1.4.11)
+        if (activeRuleSet['wcag-non-text-contrast'] && !isPage && !isSection && !truncated) {
+          try {
+            if ((nodeType === 'FRAME' || nodeType === 'COMPONENT' || nodeType === 'INSTANCE' || nodeType === 'COMPONENT_SET') && interactiveNameRegex.test(nodeName)) {
+              var uiFill = lintGetNodeFillColor(node);
+              var uiStroke = lintGetNodeStrokeColor(node);
+              var uiBg = lintGetEffectiveBg(node);
+              // Check fill against background
+              if (uiFill) {
+                var uiRatio = lintContrastRatio(uiFill.r, uiFill.g, uiFill.b, uiBg.r, uiBg.g, uiBg.b);
+                if (uiRatio < 3.0) {
+                  if (totalFindings < maxFindings) {
+                    findings['wcag-non-text-contrast'].push({
+                      id: nodeId,
+                      name: nodeName,
+                      ratio: uiRatio.toFixed(1) + ':1',
+                      required: '3.0:1',
+                      component: lintRgbToHex(uiFill.r, uiFill.g, uiFill.b),
+                      bg: lintRgbToHex(uiBg.r, uiBg.g, uiBg.b),
+                      element: 'fill'
+                    });
+                    totalFindings++;
+                  } else { truncated = true; }
+                }
+              }
+              // Check stroke/border against background
+              if (uiStroke && !truncated) {
+                var strokeRatio = lintContrastRatio(uiStroke.r, uiStroke.g, uiStroke.b, uiBg.r, uiBg.g, uiBg.b);
+                if (strokeRatio < 3.0) {
+                  if (totalFindings < maxFindings) {
+                    findings['wcag-non-text-contrast'].push({
+                      id: nodeId,
+                      name: nodeName,
+                      ratio: strokeRatio.toFixed(1) + ':1',
+                      required: '3.0:1',
+                      component: lintRgbToHex(uiStroke.r, uiStroke.g, uiStroke.b),
+                      bg: lintRgbToHex(uiBg.r, uiBg.g, uiBg.b),
+                      element: 'stroke'
+                    });
+                    totalFindings++;
+                  } else { truncated = true; }
+                }
+              }
+            }
+          } catch (e) { /* slot sublayer */ }
+        }
+
+        // wcag-color-only: Component variants that differ only by color (WCAG 1.4.1)
+        if (activeRuleSet['wcag-color-only'] && nodeType === 'COMPONENT_SET' && !truncated) {
+          try {
+            var variants = node.children;
+            if (variants && variants.length >= 2) {
+              // Compare each variant pair for color-only differentiation
+              for (var vi = 0; vi < variants.length && !truncated; vi++) {
+                var variant = variants[vi];
+                try {
+                  var vName = variant.name.toLowerCase();
+                  // Only check state-related variants (error, warning, success, disabled)
+                  if (/(error|warning|danger|success|invalid|alert)/.test(vName)) {
+                    if (!lintHasNonColorIndicator(variant)) {
+                      // Check if this variant's fill differs from default
+                      var defaultVariant = null;
+                      for (var dvi = 0; dvi < variants.length; dvi++) {
+                        var dvName = variants[dvi].name.toLowerCase();
+                        if (/(default|rest|idle|normal|base)/.test(dvName) || dvi === 0) {
+                          defaultVariant = variants[dvi];
+                          break;
+                        }
+                      }
+                      if (defaultVariant) {
+                        var varFill = lintGetNodeFillColor(variant);
+                        var defFill = lintGetNodeFillColor(defaultVariant);
+                        if (varFill && defFill && (varFill.r !== defFill.r || varFill.g !== defFill.g || varFill.b !== defFill.b)) {
+                          if (totalFindings < maxFindings) {
+                            findings['wcag-color-only'].push({
+                              id: variant.id,
+                              name: nodeName + ' / ' + variant.name,
+                              variantColor: lintRgbToHex(varFill.r, varFill.g, varFill.b),
+                              defaultColor: lintRgbToHex(defFill.r, defFill.g, defFill.b),
+                              suggestion: 'Add an icon, text label, or border to differentiate this state beyond color alone'
+                            });
+                            totalFindings++;
+                          } else { truncated = true; }
+                        }
+                      }
+                    }
+                  }
+                } catch (e) { /* skip variant */ }
+              }
+            }
+          } catch (e) { /* slot sublayer */ }
+        }
+
+        // wcag-focus-indicator: Interactive components missing focus variant (WCAG 2.4.7)
+        if (activeRuleSet['wcag-focus-indicator'] && nodeType === 'COMPONENT_SET' && !truncated) {
+          try {
+            if (interactiveNameRegex.test(nodeName)) {
+              var hasFocusVariant = false;
+              var focusVariantNode = null;
+              var csVariants = node.children;
+              if (csVariants) {
+                for (var fvi = 0; fvi < csVariants.length; fvi++) {
+                  var fvName = csVariants[fvi].name.toLowerCase();
+                  if (/focus|focused/.test(fvName)) {
+                    hasFocusVariant = true;
+                    focusVariantNode = csVariants[fvi];
+                    break;
+                  }
+                }
+              }
+              if (!hasFocusVariant) {
+                if (totalFindings < maxFindings) {
+                  findings['wcag-focus-indicator'].push({
+                    id: nodeId,
+                    name: nodeName,
+                    issue: 'missing-variant',
+                    suggestion: 'Add a focus/focused variant with a visible focus ring or outline'
+                  });
+                  totalFindings++;
+                } else { truncated = true; }
+              } else if (focusVariantNode) {
+                // Check if focus variant has a visible stroke/border (focus ring)
+                var focusStroke = lintGetNodeStrokeColor(focusVariantNode);
+                var hasFocusEffect = false;
+                try {
+                  var effects = focusVariantNode.effects;
+                  if (effects) {
+                    for (var ei = 0; ei < effects.length; ei++) {
+                      if (effects[ei].visible !== false && (effects[ei].type === 'DROP_SHADOW' || effects[ei].type === 'INNER_SHADOW')) {
+                        hasFocusEffect = true;
+                        break;
+                      }
+                    }
+                  }
+                } catch (e) { /* skip */ }
+                if (!focusStroke && !hasFocusEffect) {
+                  if (totalFindings < maxFindings) {
+                    findings['wcag-focus-indicator'].push({
+                      id: focusVariantNode.id,
+                      name: nodeName + ' / ' + focusVariantNode.name,
+                      issue: 'no-visible-indicator',
+                      suggestion: 'Focus variant exists but has no visible border, outline, or shadow for the focus indicator'
+                    });
+                    totalFindings++;
+                  } else { truncated = true; }
+                }
+              }
+            }
+          } catch (e) { /* slot sublayer */ }
+        }
+
+        // wcag-letter-spacing: Negative letter spacing (WCAG 1.4.12)
+        if (activeRuleSet['wcag-letter-spacing'] && nodeType === 'TEXT' && !truncated) {
+          try {
+            var ls = node.letterSpacing;
+            if (ls && typeof ls === 'object' && typeof ls.value === 'number') {
+              if (ls.unit === 'PIXELS' && ls.value < 0) {
+                if (totalFindings < maxFindings) {
+                  findings['wcag-letter-spacing'].push({
+                    id: nodeId,
+                    name: nodeName,
+                    letterSpacing: ls.value + 'px'
+                  });
+                  totalFindings++;
+                } else { truncated = true; }
+              } else if (ls.unit === 'PERCENT' && ls.value < 0) {
+                if (totalFindings < maxFindings) {
+                  findings['wcag-letter-spacing'].push({
+                    id: nodeId,
+                    name: nodeName,
+                    letterSpacing: ls.value + '%'
+                  });
+                  totalFindings++;
+                } else { truncated = true; }
+              }
+            }
+          } catch (e) { /* slot sublayer or mixed */ }
+        }
+
+        // wcag-paragraph-spacing: Paragraph spacing < 2x font size (WCAG 1.4.12)
+        if (activeRuleSet['wcag-paragraph-spacing'] && nodeType === 'TEXT' && !truncated) {
+          try {
+            var ps = node.paragraphSpacing;
+            var psFs = node.fontSize;
+            if (typeof ps === 'number' && typeof psFs === 'number' && ps > 0) {
+              var requiredPs = 2 * psFs;
+              if (ps < requiredPs && textHasMultipleParagraphs(node)) {
+                if (totalFindings < maxFindings) {
+                  findings['wcag-paragraph-spacing'].push({
+                    id: nodeId,
+                    name: nodeName,
+                    paragraphSpacing: ps,
+                    fontSize: psFs,
+                    recommended: requiredPs
+                  });
+                  totalFindings++;
+                } else { truncated = true; }
+              }
+            }
+          } catch (e) { /* slot sublayer or mixed */ }
+        }
+
+        // wcag-image-alt: Image fills without description (WCAG 1.1.1)
+        if (activeRuleSet['wcag-image-alt'] && !isPage && !isSection && !truncated) {
+          try {
+            var hasImageFill = false;
+            var imgFills = node.fills;
+            if (imgFills && imgFills.length > 0) {
+              for (var ifi = 0; ifi < imgFills.length; ifi++) {
+                if (imgFills[ifi].type === 'IMAGE' && imgFills[ifi].visible !== false) {
+                  hasImageFill = true;
+                  break;
+                }
+              }
+            }
+            if (hasImageFill) {
+              var hasDescription = false;
+              try {
+                if (node.description && node.description.trim().length > 0) {
+                  hasDescription = true;
+                }
+              } catch (e) { /* skip */ }
+              // Also check if node name indicates decorative
+              var isDecorative = false;
+              try {
+                var lowerName = nodeName.toLowerCase();
+                if (lowerName === 'decorative' || lowerName === 'decoration' || lowerName.indexOf('decorative') !== -1) {
+                  isDecorative = true;
+                }
+              } catch (e) { /* skip */ }
+              if (!hasDescription && !isDecorative) {
+                if (totalFindings < maxFindings) {
+                  findings['wcag-image-alt'].push({
+                    id: nodeId,
+                    name: nodeName,
+                    suggestion: 'Add a description in the node\'s description field, or name it "decorative" if purely presentational'
+                  });
+                  totalFindings++;
+                } else { truncated = true; }
+              }
+            }
+          } catch (e) { /* slot sublayer */ }
+        }
+
+        // wcag-heading-hierarchy: Track heading levels for hierarchy check (WCAG 1.3.1)
+        if (activeRuleSet['wcag-heading-hierarchy'] && nodeType === 'TEXT' && !truncated) {
+          try {
+            var hlevel = lintGetHeadingLevel(node);
+            if (hlevel > 0) {
+              headingSequence.push({ level: hlevel, id: nodeId, name: nodeName });
+            }
+          } catch (e) { /* skip */ }
+        }
+
+        // wcag-reflow: Fixed-position frames without auto-layout (WCAG 1.4.10)
+        if (activeRuleSet['wcag-reflow'] && !isPage && !isSection && !truncated) {
+          try {
+            if ((nodeType === 'FRAME' || nodeType === 'COMPONENT') && node.children && node.children.length >= 3) {
+              var rlLayoutMode = 'NONE';
+              try { rlLayoutMode = node.layoutMode; } catch (e) { /* skip */ }
+              if (!rlLayoutMode || rlLayoutMode === 'NONE') {
+                // Check if children use absolute positioning (different x/y values)
+                var hasAbsoluteChildren = false;
+                var childXs = [];
+                var childYs = [];
+                for (var rci = 0; rci < Math.min(node.children.length, 10); rci++) {
+                  try {
+                    childXs.push(node.children[rci].x);
+                    childYs.push(node.children[rci].y);
+                  } catch (e) { /* skip */ }
+                }
+                if (childXs.length >= 3) {
+                  // If children are spread across both axes, it's likely absolute positioning
+                  var uniqueXs = [];
+                  var uniqueYs = [];
+                  for (var uxi = 0; uxi < childXs.length; uxi++) {
+                    if (uniqueXs.indexOf(childXs[uxi]) === -1) uniqueXs.push(childXs[uxi]);
+                    if (uniqueYs.indexOf(childYs[uxi]) === -1) uniqueYs.push(childYs[uxi]);
+                  }
+                  hasAbsoluteChildren = uniqueXs.length > 2 && uniqueYs.length > 2;
+                }
+                if (hasAbsoluteChildren) {
+                  if (totalFindings < maxFindings) {
+                    findings['wcag-reflow'].push({
+                      id: nodeId,
+                      name: nodeName,
+                      childCount: node.children.length,
+                      suggestion: 'Convert to auto-layout so content can reflow at different viewport sizes'
+                    });
+                    totalFindings++;
+                  } else { truncated = true; }
+                }
+              }
+            }
+          } catch (e) { /* slot sublayer */ }
+        }
+
+        // wcag-reading-order: Check if visual order matches layer order (WCAG 1.3.2)
+        if (activeRuleSet['wcag-reading-order'] && !isPage && !isSection && !truncated) {
+          try {
+            if ((nodeType === 'FRAME' || nodeType === 'COMPONENT' || nodeType === 'INSTANCE') && node.children && node.children.length >= 2) {
+              var roLayoutMode = 'NONE';
+              try { roLayoutMode = node.layoutMode; } catch (e) { /* skip */ }
+              // Only check non-auto-layout frames (auto-layout enforces order)
+              if (!roLayoutMode || roLayoutMode === 'NONE') {
+                // Collect children y positions (for vertical reading order)
+                var childPositions = [];
+                for (var roi = 0; roi < node.children.length; roi++) {
+                  try {
+                    childPositions.push({
+                      index: roi,
+                      y: node.children[roi].y,
+                      x: node.children[roi].x,
+                      name: node.children[roi].name
+                    });
+                  } catch (e) { /* skip */ }
+                }
+                if (childPositions.length >= 2) {
+                  // Sort by visual position (top-to-bottom, left-to-right)
+                  var visualOrder = childPositions.slice().sort(function(a, b) {
+                    if (Math.abs(a.y - b.y) > 10) return a.y - b.y; // Different row
+                    return a.x - b.x; // Same row, left to right
+                  });
+                  // Check if layer order matches visual order
+                  var orderMismatches = 0;
+                  for (var omi = 0; omi < visualOrder.length; omi++) {
+                    if (visualOrder[omi].index !== omi) {
+                      orderMismatches++;
+                    }
+                  }
+                  // Flag if more than 30% of elements are out of order
+                  if (orderMismatches > childPositions.length * 0.3 && orderMismatches >= 2) {
+                    if (totalFindings < maxFindings) {
+                      findings['wcag-reading-order'].push({
+                        id: nodeId,
+                        name: nodeName,
+                        childCount: childPositions.length,
+                        mismatches: orderMismatches,
+                        suggestion: 'Reorder layers to match visual top-to-bottom, left-to-right reading order'
+                      });
+                      totalFindings++;
+                    } else { truncated = true; }
+                  }
+                }
+              }
+            }
+          } catch (e) { /* slot sublayer */ }
+        }
+
+        // wcag-disabled-no-context: Disabled variant without tooltip/helper text (Isabella's pattern)
+        if (activeRuleSet['wcag-disabled-no-context'] && nodeType === 'COMPONENT_SET' && !truncated) {
+          try {
+            var csChildren = node.children;
+            if (csChildren) {
+              for (var dci = 0; dci < csChildren.length && !truncated; dci++) {
+                var dcVariant = csChildren[dci];
+                try {
+                  var dcName = dcVariant.name || '';
+                  if (/(disabled|inactive)/i.test(dcName)) {
+                    // Check if disabled variant has tooltip, helper text, or descriptive child
+                    var hasContextChild = false;
+                    try {
+                      if (dcVariant.children) {
+                        for (var dcci = 0; dcci < dcVariant.children.length; dcci++) {
+                          var dcChild = dcVariant.children[dcci];
+                          try {
+                            var dcChildName = (dcChild.name || '').toLowerCase();
+                            // Look for tooltip, helper text, hint, description, or error message children
+                            if (/tooltip|helper|hint|description|message|caption|note|info|why|reason/i.test(dcChildName)) {
+                              hasContextChild = true;
+                              break;
+                            }
+                            // Recurse one level for nested tooltip/helper
+                            if (dcChild.children) {
+                              for (var dcgci = 0; dcgci < dcChild.children.length; dcgci++) {
+                                var dcGrandchild = dcChild.children[dcgci];
+                                try {
+                                  if (/tooltip|helper|hint|description|message/i.test(dcGrandchild.name || '')) {
+                                    hasContextChild = true;
+                                    break;
+                                  }
+                                } catch (e) { /* skip */ }
+                              }
+                              if (hasContextChild) break;
+                            }
+                          } catch (e) { /* skip */ }
+                        }
+                      }
+                    } catch (e) { /* skip */ }
+                    // Also check component description for disabled guidance
+                    var hasDisabledAnnotation = false;
+                    try {
+                      var csDesc = (node.description || '').toLowerCase();
+                      if (/disabled.*tooltip|disabled.*helper|disabled.*hint|aria-disabled|why.*disabled|disabled.*reason/i.test(csDesc)) {
+                        hasDisabledAnnotation = true;
+                      }
+                    } catch (e) { /* skip */ }
+                    if (!hasContextChild && !hasDisabledAnnotation) {
+                      if (totalFindings < maxFindings) {
+                        findings['wcag-disabled-no-context'].push({
+                          id: dcVariant.id,
+                          name: nodeName + ' / ' + dcVariant.name,
+                          suggestion: 'Disabled elements should remain focusable (use aria-disabled, not HTML disabled). Add a tooltip or helper text explaining why the element is disabled so screen reader users understand the context.'
+                        });
+                        totalFindings++;
+                      } else { truncated = true; }
+                    }
+                  }
+                } catch (e) { /* skip variant */ }
+              }
+            }
+          } catch (e) { /* slot sublayer */ }
+        }
+
         // ---- Design System checks ----
+
+        // token-misuse: Variable name prefix doesn't match usage context
+        if (activeRuleSet['token-misuse'] && !isPage && !isSection && !truncated) {
+          try {
+            var tmFills = node.fills;
+            if (tmFills && tmFills.length > 0) {
+              for (var tmi = 0; tmi < tmFills.length; tmi++) {
+                var tmFill = tmFills[tmi];
+                if (tmFill.type === 'SOLID' && tmFill.visible !== false) {
+                  try {
+                    if (tmFill.boundVariables && tmFill.boundVariables.color) {
+                      var tmVarId = tmFill.boundVariables.color.id;
+                      // Resolve variable name
+                      try {
+                        var tmVar = figma.variables.getVariableById(tmVarId);
+                        if (tmVar) {
+                          var tmVarName = tmVar.name.toLowerCase();
+                          var isBgToken = /^(bg|background|surface|fill)[\/-]/.test(tmVarName);
+                          var isTextNode = nodeType === 'TEXT';
+                          // Flag: bg/surface token used as text fill
+                          if (isTextNode && isBgToken) {
+                            if (totalFindings < maxFindings) {
+                              findings['token-misuse'].push({
+                                id: nodeId,
+                                name: nodeName,
+                                variable: tmVar.name,
+                                usage: 'text fill',
+                                expectedPrefix: 'text/*, fg/*, foreground/*',
+                                suggestion: 'This text node uses a background/surface token ("' + tmVar.name + '") as its fill color. This is likely a misbound token — use a text/foreground token instead.'
+                              });
+                              totalFindings++;
+                            } else { truncated = true; }
+                          }
+                          // Flag: text/foreground token used as frame/shape background
+                          var isTextToken = /^(text|fg|foreground|font)[\/-]/.test(tmVarName);
+                          var isContainerNode = nodeType === 'FRAME' || nodeType === 'COMPONENT' || nodeType === 'INSTANCE' || nodeType === 'RECTANGLE';
+                          if (isContainerNode && isTextToken && !truncated) {
+                            if (totalFindings < maxFindings) {
+                              findings['token-misuse'].push({
+                                id: nodeId,
+                                name: nodeName,
+                                variable: tmVar.name,
+                                usage: 'background fill',
+                                expectedPrefix: 'bg/*, background/*, surface/*',
+                                suggestion: 'This container uses a text/foreground token ("' + tmVar.name + '") as its background fill. This is likely a misbound token — use a background/surface token instead.'
+                              });
+                              totalFindings++;
+                            } else { truncated = true; }
+                          }
+                        }
+                      } catch (e) { /* can't resolve variable */ }
+                    }
+                  } catch (e) { /* no bound vars */ }
+                }
+              }
+            }
+          } catch (e) { /* slot sublayer */ }
+        }
 
         // hardcoded-color: Solid fills without variable binding or style
         if (activeRuleSet['hardcoded-color'] && !isPage && !isSection && !truncated) {
@@ -3606,6 +5255,31 @@ figma.ui.onmessage = async (msg) => {
       // ---- Execute walk ----
       walkNode(rootNode, 0);
 
+      // ---- Post-walk: heading hierarchy validation ----
+      if (activeRuleSet['wcag-heading-hierarchy'] && headingSequence.length >= 2 && !truncated) {
+        var prevLevel = 0;
+        for (var hi = 0; hi < headingSequence.length; hi++) {
+          var h = headingSequence[hi];
+          if (prevLevel > 0 && h.level > prevLevel + 1) {
+            // Skipped a level (e.g., H1 → H3)
+            if (totalFindings < maxFindings) {
+              findings['wcag-heading-hierarchy'].push({
+                id: h.id,
+                name: h.name,
+                level: h.level,
+                previousLevel: prevLevel,
+                suggestion: 'Expected H' + (prevLevel + 1) + ' but found H' + h.level + '. Do not skip heading levels.'
+              });
+              totalFindings++;
+            } else {
+              truncated = true;
+              break;
+            }
+          }
+          prevLevel = h.level;
+        }
+      }
+
       // ---- Build response ----
       var categories = [];
       var summaryObj = { critical: 0, warning: 0, info: 0, total: 0 };
@@ -3617,6 +5291,7 @@ figma.ui.onmessage = async (msg) => {
         categories.push({
           rule: ruleId,
           severity: sev,
+          wcagLevel: wcagLevelMap[ruleId] || null,
           count: findings[ruleId].length,
           description: ruleDescriptions[ruleId],
           nodes: findings[ruleId]
@@ -3654,6 +5329,650 @@ figma.ui.onmessage = async (msg) => {
         requestId: msg.requestId,
         success: false,
         error: errorMsg
+      });
+    }
+  }
+
+  // ============================================================================
+  // AUDIT_COMPONENT_ACCESSIBILITY — Deep accessibility audit for a component set
+  // ============================================================================
+  else if (msg.type === 'AUDIT_COMPONENT_ACCESSIBILITY') {
+    try {
+      console.log('🌉 [Desktop Bridge] Running component accessibility audit...');
+
+      // ---- Color science helpers (shared with lint) ----
+      function auditLinearize(c) {
+        return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+      }
+      function auditLuminance(r, g, b) {
+        return 0.2126 * auditLinearize(r) + 0.7152 * auditLinearize(g) + 0.0722 * auditLinearize(b);
+      }
+      function auditContrastRatio(r1, g1, b1, r2, g2, b2) {
+        var l1 = auditLuminance(r1, g1, b1);
+        var l2 = auditLuminance(r2, g2, b2);
+        return (Math.max(l1, l2) + 0.05) / (Math.min(l1, l2) + 0.05);
+      }
+      function auditRgbToHex(r, g, b) {
+        var rr = Math.round(r * 255).toString(16);
+        var gg = Math.round(g * 255).toString(16);
+        var bb = Math.round(b * 255).toString(16);
+        if (rr.length === 1) rr = '0' + rr;
+        if (gg.length === 1) gg = '0' + gg;
+        if (bb.length === 1) bb = '0' + bb;
+        return '#' + rr.toUpperCase() + gg.toUpperCase() + bb.toUpperCase();
+      }
+
+      // ---- Color-blind simulation matrices ----
+      // Brettel/Vienot transformation matrices for dichromatic vision
+      var colorBlindMatrices = {
+        protanopia: [
+          [0.152286, 1.052583, -0.204868],
+          [0.114503, 0.786281, 0.099216],
+          [-0.003882, -0.048116, 1.051998]
+        ],
+        deuteranopia: [
+          [0.367322, 0.860646, -0.227968],
+          [0.280085, 0.672501, 0.047413],
+          [-0.011820, 0.042940, 0.968881]
+        ],
+        tritanopia: [
+          [1.255528, -0.076749, -0.178779],
+          [-0.078411, 0.930809, 0.147602],
+          [0.004733, 0.691367, 0.303900]
+        ]
+      };
+
+      function simulateColorBlind(r, g, b, matrix) {
+        var nr = Math.max(0, Math.min(1, matrix[0][0] * r + matrix[0][1] * g + matrix[0][2] * b));
+        var ng = Math.max(0, Math.min(1, matrix[1][0] * r + matrix[1][1] * g + matrix[1][2] * b));
+        var nb = Math.max(0, Math.min(1, matrix[2][0] * r + matrix[2][1] * g + matrix[2][2] * b));
+        return { r: nr, g: ng, b: nb };
+      }
+
+      // ---- Node inspection helpers ----
+      function auditGetFillColor(node) {
+        try {
+          var fills = node.fills;
+          if (fills && fills.length > 0) {
+            for (var i = fills.length - 1; i >= 0; i--) {
+              if (fills[i].type === 'SOLID' && fills[i].visible !== false) {
+                return { r: fills[i].color.r, g: fills[i].color.g, b: fills[i].color.b };
+              }
+            }
+          }
+        } catch (e) { /* skip */ }
+        return null;
+      }
+
+      function auditGetStrokeColor(node) {
+        try {
+          var strokes = node.strokes;
+          if (strokes && strokes.length > 0) {
+            for (var i = strokes.length - 1; i >= 0; i--) {
+              if (strokes[i].type === 'SOLID' && strokes[i].visible !== false) {
+                return { r: strokes[i].color.r, g: strokes[i].color.g, b: strokes[i].color.b };
+              }
+            }
+          }
+        } catch (e) { /* skip */ }
+        return null;
+      }
+
+      function auditGetEffectiveBg(node) {
+        var current = node.parent;
+        while (current) {
+          try {
+            if (current.fills && current.fills.length > 0) {
+              for (var fi = current.fills.length - 1; fi >= 0; fi--) {
+                var fill = current.fills[fi];
+                if (fill.type === 'SOLID' && fill.visible !== false) {
+                  return { r: fill.color.r, g: fill.color.g, b: fill.color.b };
+                }
+              }
+            }
+          } catch (e) { /* skip */ }
+          current = current.parent;
+        }
+        return { r: 1, g: 1, b: 1 };
+      }
+
+      function auditHasChildOfType(node, types) {
+        try {
+          if (!node.children) return false;
+          for (var i = 0; i < node.children.length; i++) {
+            var child = node.children[i];
+            try {
+              for (var t = 0; t < types.length; t++) {
+                if (child.type === types[t]) return true;
+              }
+              // Recurse one level deeper for nested icons
+              if (child.children) {
+                for (var j = 0; j < child.children.length; j++) {
+                  try {
+                    for (var t2 = 0; t2 < types.length; t2++) {
+                      if (child.children[j].type === types[t2]) return true;
+                    }
+                  } catch (e) { /* skip */ }
+                }
+              }
+            } catch (e) { /* skip */ }
+          }
+        } catch (e) { /* skip */ }
+        return false;
+      }
+
+      // Collect all text fill colors and background colors from a variant tree
+      function auditCollectColorPairs(node, pairs, depth) {
+        if (depth > 5) return;
+        try {
+          if (node.type === 'TEXT') {
+            var fills = node.fills;
+            if (fills && fills.length > 0) {
+              for (var i = 0; i < fills.length; i++) {
+                if (fills[i].type === 'SOLID' && fills[i].visible !== false) {
+                  var bg = auditGetEffectiveBg(node);
+                  pairs.push({
+                    fg: { r: fills[i].color.r, g: fills[i].color.g, b: fills[i].color.b },
+                    bg: bg,
+                    nodeName: node.name,
+                    nodeId: node.id
+                  });
+                  break;
+                }
+              }
+            }
+          }
+          if (node.children) {
+            for (var ci = 0; ci < node.children.length; ci++) {
+              auditCollectColorPairs(node.children[ci], pairs, depth + 1);
+            }
+          }
+        } catch (e) { /* skip */ }
+      }
+
+      // ---- Resolve target node ----
+      var targetNode;
+      if (msg.nodeId) {
+        targetNode = await figma.getNodeByIdAsync(msg.nodeId);
+        if (!targetNode) {
+          throw new Error('Node not found: ' + msg.nodeId);
+        }
+      } else {
+        // Try current selection
+        var sel = figma.currentPage.selection;
+        if (sel && sel.length === 1) {
+          targetNode = sel[0];
+        } else {
+          throw new Error('No nodeId provided and no single node selected. Select a component set or provide a nodeId.');
+        }
+      }
+
+      // If user selected a COMPONENT or INSTANCE, walk up to the COMPONENT_SET
+      var componentSet = targetNode;
+      if (targetNode.type === 'COMPONENT' && targetNode.parent && targetNode.parent.type === 'COMPONENT_SET') {
+        componentSet = targetNode.parent;
+      } else if (targetNode.type === 'INSTANCE') {
+        try {
+          var mainComponent = await targetNode.getMainComponentAsync();
+          if (mainComponent && mainComponent.parent && mainComponent.parent.type === 'COMPONENT_SET') {
+            componentSet = mainComponent.parent;
+          } else if (mainComponent && mainComponent.type === 'COMPONENT') {
+            componentSet = mainComponent;
+          }
+        } catch (e) { /* use target as-is */ }
+      }
+
+      var isComponentSet = componentSet.type === 'COMPONENT_SET';
+      var isComponent = componentSet.type === 'COMPONENT';
+      if (!isComponentSet && !isComponent) {
+        throw new Error('Node "' + componentSet.name + '" is type ' + componentSet.type + '. Expected COMPONENT_SET or COMPONENT.');
+      }
+
+      // ---- Analyze variants ----
+      var variants = isComponentSet ? componentSet.children : [componentSet];
+      var variantCount = variants.length;
+
+      // ---- Classify component as interactive vs presentational ----
+      var interactiveNames = /^(button|link|input|checkbox|radio|switch|toggle|tab|select|slider|dropdown|menu-item|search|combobox|listbox)/i;
+      var presentationalNames = /^(alert|badge|card|avatar|divider|skeleton|tooltip|tag|chip|banner|callout|notification|toast|icon|image|separator|progress|spinner|loader|breadcrumb|label|heading|paragraph|caption|stat|meter|indicator)/i;
+
+      // Parse variant axes from variant names (e.g., "type=success, style=fill" → {type: [...], style: [...]})
+      var variantAxes = {};
+      var hasStateAxis = false;
+      for (var vai = 0; vai < variants.length; vai++) {
+        var vParts = variants[vai].name.split(',');
+        for (var vpi = 0; vpi < vParts.length; vpi++) {
+          var kv = vParts[vpi].trim().split('=');
+          if (kv.length === 2) {
+            var axisName = kv[0].trim().toLowerCase();
+            var axisValue = kv[1].trim().toLowerCase();
+            if (!variantAxes[axisName]) variantAxes[axisName] = [];
+            if (variantAxes[axisName].indexOf(axisValue) === -1) {
+              variantAxes[axisName].push(axisValue);
+            }
+            // Check if this axis contains interaction state values
+            if (axisName === 'state' && /(hover|focus|pressed|disabled|active)/i.test(axisValue)) {
+              hasStateAxis = true;
+            }
+          }
+        }
+      }
+
+      var componentName = componentSet.name || '';
+      var isInteractive = interactiveNames.test(componentName) || hasStateAxis;
+      var isPresentational = !isInteractive && (presentationalNames.test(componentName) || !hasStateAxis);
+      // If ambiguous, check if any variant mentions interaction states
+      if (!isInteractive && !isPresentational) {
+        for (var ami = 0; ami < variants.length; ami++) {
+          if (/(hover|focus|pressed|disabled)/i.test(variants[ami].name)) {
+            isInteractive = true;
+            break;
+          }
+        }
+        if (!isInteractive) isPresentational = true;
+      }
+
+      // 1. Coverage analysis — adapts to component classification
+      var stateKeywords = {
+        'default': /(default|rest|idle|normal|base)/i,
+        'hover': /(hover|hovered)/i,
+        'focus': /(focus|focused)/i,
+        'disabled': /(disabled|inactive)/i,
+        'error': /(error|invalid|danger)/i,
+        'active': /(active|pressed|selected)/i,
+        'loading': /(loading|spinner)/i
+      };
+
+      var coveredCount = 0;
+      var totalStates = 0;
+      var missingStates = [];
+      var statesCovered = {};
+      var statesFound = {};
+      var coverageLabel = '';
+      var variantAxisCoverage = null;
+
+      if (isInteractive) {
+        // Interactive components: check for interaction states
+        coverageLabel = 'interactive-states';
+        for (var sk in stateKeywords) {
+          statesCovered[sk] = false;
+          statesFound[sk] = null;
+        }
+        for (var vi = 0; vi < variants.length; vi++) {
+          var vName = variants[vi].name;
+          for (var sk2 in stateKeywords) {
+            if (stateKeywords[sk2].test(vName)) {
+              statesCovered[sk2] = true;
+              if (!statesFound[sk2]) statesFound[sk2] = vName;
+            }
+          }
+        }
+        if (variantCount === 1 && !statesCovered['default']) {
+          statesCovered['default'] = true;
+          statesFound['default'] = variants[0].name;
+        }
+        for (var sk3 in statesCovered) {
+          totalStates++;
+          if (statesCovered[sk3]) {
+            coveredCount++;
+          } else {
+            missingStates.push(sk3);
+          }
+        }
+      } else {
+        // Presentational components: check variant axis completeness
+        coverageLabel = 'variant-axes';
+        // Calculate expected combinations vs actual
+        var axisNames = [];
+        var axisCounts = [];
+        var expectedCombinations = 1;
+        for (var axName in variantAxes) {
+          axisNames.push(axName);
+          axisCounts.push(variantAxes[axName].length);
+          expectedCombinations *= variantAxes[axName].length;
+        }
+        // Score: actual variants / expected combinations (capped at 100%)
+        var axisCoverageRatio = expectedCombinations > 0 ? Math.min(1, variantCount / expectedCombinations) : 1;
+        coveredCount = variantCount;
+        totalStates = expectedCombinations;
+        variantAxisCoverage = {
+          axes: variantAxes,
+          axisCount: axisNames.length,
+          expectedCombinations: expectedCombinations,
+          actualVariants: variantCount,
+          completeness: Math.round(axisCoverageRatio * 100) + '%'
+        };
+        // For presentational, no "missing states" — instead note if combinations are incomplete
+        if (variantCount < expectedCombinations) {
+          missingStates.push(variantCount + '/' + expectedCombinations + ' axis combinations present');
+        }
+      }
+
+      // 2. Focus indicator quality
+      var focusAnalysis = { hasVariant: false, hasVisibleIndicator: false, contrastRatio: null, details: '' };
+      if (statesCovered['focus'] && isComponentSet) {
+        focusAnalysis.hasVariant = true;
+        for (var fvi = 0; fvi < variants.length; fvi++) {
+          if (/(focus|focused)/i.test(variants[fvi].name)) {
+            var focusNode = variants[fvi];
+            // Check for stroke (focus ring)
+            var fStroke = auditGetStrokeColor(focusNode);
+            if (fStroke) {
+              var fBg = auditGetEffectiveBg(focusNode);
+              var fRatio = auditContrastRatio(fStroke.r, fStroke.g, fStroke.b, fBg.r, fBg.g, fBg.b);
+              focusAnalysis.hasVisibleIndicator = true;
+              focusAnalysis.contrastRatio = parseFloat(fRatio.toFixed(1));
+              focusAnalysis.details = 'Focus ring (stroke) with ' + fRatio.toFixed(1) + ':1 contrast';
+              break;
+            }
+            // Check for shadow effect
+            try {
+              var effects = focusNode.effects;
+              if (effects) {
+                for (var ei = 0; ei < effects.length; ei++) {
+                  if (effects[ei].visible !== false && (effects[ei].type === 'DROP_SHADOW' || effects[ei].type === 'INNER_SHADOW')) {
+                    focusAnalysis.hasVisibleIndicator = true;
+                    focusAnalysis.details = 'Focus indicator via ' + effects[ei].type.toLowerCase().replace('_', ' ');
+                    break;
+                  }
+                }
+              }
+            } catch (e) { /* skip */ }
+            if (!focusAnalysis.hasVisibleIndicator) {
+              focusAnalysis.details = 'Focus variant exists but no visible stroke or shadow detected';
+            }
+            break;
+          }
+        }
+      } else if (!statesCovered['focus']) {
+        focusAnalysis.details = 'No focus/focused variant found';
+      }
+
+      // 3. Non-color differentiation for status states
+      var colorDifferentiation = { issues: [], checked: 0 };
+      if (isComponentSet) {
+        var statusStates = ['error', 'disabled', 'active'];
+        var defaultVariant = null;
+        for (var dvi = 0; dvi < variants.length; dvi++) {
+          if (/(default|rest|idle|normal|base)/i.test(variants[dvi].name) || dvi === 0) {
+            defaultVariant = variants[dvi];
+            break;
+          }
+        }
+        for (var ssi = 0; ssi < statusStates.length; ssi++) {
+          var stateName = statusStates[ssi];
+          if (statesCovered[stateName]) {
+            colorDifferentiation.checked++;
+            for (var svi = 0; svi < variants.length; svi++) {
+              if (stateKeywords[stateName].test(variants[svi].name)) {
+                var stateVariant = variants[svi];
+                var stateFill = auditGetFillColor(stateVariant);
+                var defaultFill = defaultVariant ? auditGetFillColor(defaultVariant) : null;
+                var hasIcon = auditHasChildOfType(stateVariant, ['VECTOR', 'BOOLEAN_OPERATION', 'INSTANCE']);
+                var hasStroke = auditGetStrokeColor(stateVariant) !== null;
+                var colorDiffers = stateFill && defaultFill && (stateFill.r !== defaultFill.r || stateFill.g !== defaultFill.g || stateFill.b !== defaultFill.b);
+                if (colorDiffers && !hasIcon && !hasStroke) {
+                  colorDifferentiation.issues.push({
+                    variant: stateVariant.name,
+                    state: stateName,
+                    variantColor: stateFill ? auditRgbToHex(stateFill.r, stateFill.g, stateFill.b) : null,
+                    defaultColor: defaultFill ? auditRgbToHex(defaultFill.r, defaultFill.g, defaultFill.b) : null,
+                    suggestion: 'Add icon, border, or text indicator beyond color'
+                  });
+                }
+                break;
+              }
+            }
+          }
+        }
+      }
+
+      // 4. Target size analysis
+      // WCAG 2.5.8 applies to interactive targets — presentational components
+      // (badges, avatars, progress bars) are not tap targets by definition.
+      // Skip target size checking for presentational components to avoid false positives.
+      var targetSizeAnalysis = { minWidth: Infinity, minHeight: Infinity, variants: [], issues: [] };
+      var minTarget = msg.targetSize || 24; // Default WCAG 2.5.8 minimum
+      for (var tvi = 0; tvi < variants.length; tvi++) {
+        try {
+          var tw = variants[tvi].width;
+          var th = variants[tvi].height;
+          if (typeof tw === 'number' && typeof th === 'number') {
+            targetSizeAnalysis.variants.push({ name: variants[tvi].name, width: tw, height: th });
+            if (tw < targetSizeAnalysis.minWidth) targetSizeAnalysis.minWidth = tw;
+            if (th < targetSizeAnalysis.minHeight) targetSizeAnalysis.minHeight = th;
+            // Only flag target size issues for interactive components
+            if (isInteractive && (tw < minTarget || th < minTarget)) {
+              targetSizeAnalysis.issues.push({
+                variant: variants[tvi].name,
+                width: tw,
+                height: th,
+                required: minTarget + 'x' + minTarget
+              });
+            }
+          }
+        } catch (e) { /* skip */ }
+      }
+      if (targetSizeAnalysis.minWidth === Infinity) targetSizeAnalysis.minWidth = null;
+      if (targetSizeAnalysis.minHeight === Infinity) targetSizeAnalysis.minHeight = null;
+
+      // 5. Annotation completeness
+      var annotations = { hasDescription: false, description: '', hasA11yNotes: false, a11yNotes: '' };
+      try {
+        var desc = componentSet.description || '';
+        if (desc.trim().length > 0) {
+          annotations.hasDescription = true;
+          annotations.description = desc.substring(0, 200);
+        }
+        if (/aria|accessibility|a11y|screen.?reader|keyboard|role|tab.?order/i.test(desc)) {
+          annotations.hasA11yNotes = true;
+          // Extract just the a11y-relevant section
+          var lines = desc.split('\n');
+          var a11yLines = [];
+          for (var ali = 0; ali < lines.length; ali++) {
+            if (/aria|accessibility|a11y|screen.?reader|keyboard|role|tab.?order/i.test(lines[ali])) {
+              a11yLines.push(lines[ali].trim());
+            }
+          }
+          annotations.a11yNotes = a11yLines.join('; ').substring(0, 300);
+        }
+      } catch (e) { /* skip */ }
+
+      // 6. Color-blind simulation
+      var colorBlindAnalysis = { simulations: [], issues: [] };
+      // Collect all text/bg color pairs from the default variant (or first variant)
+      var sampleVariant = defaultVariant || variants[0];
+      var colorPairs = [];
+      auditCollectColorPairs(sampleVariant, colorPairs, 0);
+
+      // Also check component fill against its background
+      var compFill = auditGetFillColor(sampleVariant);
+      var compBg = auditGetEffectiveBg(sampleVariant);
+      if (compFill) {
+        colorPairs.push({ fg: compFill, bg: compBg, nodeName: sampleVariant.name + ' (fill)', nodeId: sampleVariant.id });
+      }
+
+      var cbTypes = ['protanopia', 'deuteranopia', 'tritanopia'];
+      for (var cbi = 0; cbi < cbTypes.length; cbi++) {
+        var cbType = cbTypes[cbi];
+        var matrix = colorBlindMatrices[cbType];
+        var failingPairs = [];
+        for (var cpi = 0; cpi < Math.min(colorPairs.length, 20); cpi++) {
+          var pair = colorPairs[cpi];
+          var simFg = simulateColorBlind(pair.fg.r, pair.fg.g, pair.fg.b, matrix);
+          var simBg = simulateColorBlind(pair.bg.r, pair.bg.g, pair.bg.b, matrix);
+          var originalRatio = auditContrastRatio(pair.fg.r, pair.fg.g, pair.fg.b, pair.bg.r, pair.bg.g, pair.bg.b);
+          var simRatio = auditContrastRatio(simFg.r, simFg.g, simFg.b, simBg.r, simBg.g, simBg.b);
+          // Flag if simulated contrast drops below 4.5:1 (AA) when original was passing
+          if (originalRatio >= 4.5 && simRatio < 4.5) {
+            failingPairs.push({
+              nodeName: pair.nodeName,
+              originalRatio: parseFloat(originalRatio.toFixed(1)),
+              simulatedRatio: parseFloat(simRatio.toFixed(1)),
+              originalFg: auditRgbToHex(pair.fg.r, pair.fg.g, pair.fg.b),
+              simulatedFg: auditRgbToHex(simFg.r, simFg.g, simFg.b)
+            });
+          }
+          // Also flag if contrast drops significantly (>30% reduction) even if still passing
+          if (originalRatio >= 4.5 && simRatio >= 4.5 && (simRatio / originalRatio) < 0.7) {
+            failingPairs.push({
+              nodeName: pair.nodeName,
+              originalRatio: parseFloat(originalRatio.toFixed(1)),
+              simulatedRatio: parseFloat(simRatio.toFixed(1)),
+              originalFg: auditRgbToHex(pair.fg.r, pair.fg.g, pair.fg.b),
+              simulatedFg: auditRgbToHex(simFg.r, simFg.g, simFg.b),
+              note: 'Significant contrast reduction (>30%)'
+            });
+          }
+        }
+        colorBlindAnalysis.simulations.push({
+          type: cbType,
+          pairsChecked: Math.min(colorPairs.length, 20),
+          issues: failingPairs.length,
+          details: failingPairs
+        });
+        if (failingPairs.length > 0) {
+          colorBlindAnalysis.issues.push(cbType + ': ' + failingPairs.length + ' color pair(s) lose sufficient contrast');
+        }
+      }
+
+      // ---- Compute overall score ----
+      var scores = {};
+      // Coverage: percentage of states (interactive) or axis combinations (presentational)
+      scores.variantCoverage = totalStates > 0 ? Math.round((coveredCount / totalStates) * 100) : 100;
+      // Focus indicator: 0 (missing), 50 (exists but no indicator), 100 (good indicator)
+      // For presentational: N/A → score 100 (don't penalize)
+      scores.focusIndicator = isPresentational ? 100 : (!focusAnalysis.hasVariant ? 0 : (!focusAnalysis.hasVisibleIndicator ? 50 : 100));
+      // Color differentiation: 100 if no issues, decremented per issue
+      scores.colorDifferentiation = colorDifferentiation.checked === 0 ? 100 : Math.max(0, Math.round(((colorDifferentiation.checked - colorDifferentiation.issues.length) / colorDifferentiation.checked) * 100));
+      // Target size: N/A for presentational (not tap targets), scored for interactive
+      scores.targetSize = isPresentational ? 100 : (targetSizeAnalysis.issues.length === 0 ? 100 : Math.max(0, Math.round(((targetSizeAnalysis.variants.length - targetSizeAnalysis.issues.length) / Math.max(1, targetSizeAnalysis.variants.length)) * 100)));
+      // Annotations: 0 (nothing), 50 (description only), 100 (has a11y notes)
+      scores.annotations = annotations.hasA11yNotes ? 100 : (annotations.hasDescription ? 50 : 0);
+      // Color blind: percentage of simulations with no issues
+      var cbPassCount = 0;
+      for (var cbsi = 0; cbsi < colorBlindAnalysis.simulations.length; cbsi++) {
+        if (colorBlindAnalysis.simulations[cbsi].issues === 0) cbPassCount++;
+      }
+      scores.colorBlindSafety = colorBlindAnalysis.simulations.length > 0 ? Math.round((cbPassCount / colorBlindAnalysis.simulations.length) * 100) : 100;
+
+      // Overall weighted score — weights differ by component classification
+      var overall;
+      if (isInteractive) {
+        // Interactive: focus and states matter most
+        overall = Math.round(
+          scores.variantCoverage * 0.20 +
+          scores.focusIndicator * 0.20 +
+          scores.colorDifferentiation * 0.15 +
+          scores.targetSize * 0.15 +
+          scores.annotations * 0.10 +
+          scores.colorBlindSafety * 0.20
+        );
+      } else {
+        // Presentational: variant completeness and color safety matter most, focus is N/A
+        overall = Math.round(
+          scores.variantCoverage * 0.25 +
+          scores.colorDifferentiation * 0.25 +
+          scores.annotations * 0.15 +
+          scores.colorBlindSafety * 0.25 +
+          scores.targetSize * 0.10
+        );
+      }
+
+      // ---- Build response ----
+      var coverageSection;
+      if (isInteractive) {
+        coverageSection = {
+          mode: 'interactive-states',
+          found: statesFound,
+          missing: missingStates,
+          coverage: coveredCount + '/' + totalStates
+        };
+      } else {
+        coverageSection = {
+          mode: 'variant-axes',
+          axes: variantAxisCoverage,
+          coverage: coveredCount + '/' + totalStates
+        };
+      }
+
+      var auditResult = {
+        component: {
+          id: componentSet.id,
+          name: componentSet.name,
+          type: componentSet.type,
+          variantCount: variantCount,
+          classification: isInteractive ? 'interactive' : 'presentational'
+        },
+        overallScore: overall,
+        scores: scores,
+        variantCoverage: coverageSection,
+        focusIndicator: isInteractive ? focusAnalysis : { notApplicable: true, details: 'Focus indicators are not expected for presentational components' },
+        colorDifferentiation: colorDifferentiation,
+        targetSize: isInteractive ? {
+          minimum: minTarget + 'x' + minTarget,
+          smallest: targetSizeAnalysis.minWidth + 'x' + targetSizeAnalysis.minHeight,
+          issues: targetSizeAnalysis.issues
+        } : { notApplicable: true, details: 'Target size checks apply to interactive components (WCAG 2.5.8 is about tap targets)', smallest: targetSizeAnalysis.minWidth + 'x' + targetSizeAnalysis.minHeight },
+        annotations: annotations,
+        colorBlindSimulation: colorBlindAnalysis,
+        recommendations: []
+      };
+
+      // Generate recommendations — classification-aware
+      if (isInteractive) {
+        if (!focusAnalysis.hasVariant) {
+          auditResult.recommendations.push({ priority: 'high', area: 'focus', message: 'Add a focus/focused variant with a visible focus ring (WCAG 2.4.7)' });
+        } else if (!focusAnalysis.hasVisibleIndicator) {
+          auditResult.recommendations.push({ priority: 'medium', area: 'focus', message: 'Focus variant exists but lacks visible indicator — add a border or shadow' });
+        }
+      }
+      if (colorDifferentiation.issues.length > 0) {
+        auditResult.recommendations.push({ priority: 'high', area: 'color', message: 'Add non-color indicators (icons, borders, text) to ' + colorDifferentiation.issues.length + ' state variant(s) (WCAG 1.4.1)' });
+      }
+      if (targetSizeAnalysis.issues.length > 0) {
+        auditResult.recommendations.push({ priority: 'high', area: 'target-size', message: targetSizeAnalysis.issues.length + ' variant(s) below ' + minTarget + 'x' + minTarget + 'px minimum target size (WCAG 2.5.8)' });
+      }
+      if (!annotations.hasDescription) {
+        auditResult.recommendations.push({ priority: 'medium', area: 'documentation', message: 'Add a component description with usage guidelines' });
+      }
+      if (!annotations.hasA11yNotes) {
+        var a11yHint = isInteractive
+          ? 'Add accessibility notes (ARIA role, keyboard interactions, screen reader behavior)'
+          : 'Add accessibility notes (ARIA role, live region behavior, semantic usage)';
+        auditResult.recommendations.push({ priority: 'medium', area: 'documentation', message: a11yHint });
+      }
+      if (colorBlindAnalysis.issues.length > 0) {
+        auditResult.recommendations.push({ priority: 'medium', area: 'color-blind', message: colorBlindAnalysis.issues.join('; ') });
+      }
+      if (isInteractive) {
+        for (var msi = 0; msi < missingStates.length; msi++) {
+          var ms = missingStates[msi];
+          if (ms === 'focus' || ms === 'disabled') {
+            auditResult.recommendations.push({ priority: 'medium', area: 'states', message: 'Consider adding a "' + ms + '" variant for complete interactive state coverage' });
+          }
+        }
+      } else if (variantAxisCoverage && variantCount < variantAxisCoverage.expectedCombinations) {
+        auditResult.recommendations.push({ priority: 'low', area: 'coverage', message: variantCount + ' of ' + variantAxisCoverage.expectedCombinations + ' axis combinations present — consider adding missing variants for completeness' });
+      }
+
+      console.log('🌉 [Desktop Bridge] Component audit complete: score ' + overall + '/100 for "' + componentSet.name + '"');
+
+      figma.ui.postMessage({
+        type: 'AUDIT_COMPONENT_ACCESSIBILITY_RESULT',
+        requestId: msg.requestId,
+        success: true,
+        data: auditResult
+      });
+
+    } catch (error) {
+      var auditErrorMsg = error && error.message ? error.message : String(error);
+      console.error('🌉 [Desktop Bridge] Component accessibility audit error:', auditErrorMsg);
+      figma.ui.postMessage({
+        type: 'AUDIT_COMPONENT_ACCESSIBILITY_RESULT',
+        requestId: msg.requestId,
+        success: false,
+        error: auditErrorMsg
       });
     }
   }
@@ -3780,11 +6099,11 @@ figma.ui.onmessage = async (msg) => {
 
       connector.connectorStart = {
         endpointNodeId: msg.startNodeId,
-        magnet: 'AUTO'
+        magnet: msg.startMagnet || 'AUTO'
       };
       connector.connectorEnd = {
         endpointNodeId: msg.endNodeId,
-        magnet: 'AUTO'
+        magnet: msg.endMagnet || 'AUTO'
       };
 
       // Set label text if provided
@@ -3817,6 +6136,55 @@ figma.ui.onmessage = async (msg) => {
     }
   }
 
+  // CREATE_SECTION - Create a section on FigJam board
+  else if (msg.type === 'CREATE_SECTION') {
+    try {
+      if (__editorType !== 'figjam') {
+        throw new Error('CREATE_SECTION is only available in FigJam files');
+      }
+      console.log('🌉 [Desktop Bridge] Creating section');
+
+      var section = figma.createSection();
+      if (msg.name) section.name = msg.name;
+      if (typeof msg.x === 'number') section.x = msg.x;
+      if (typeof msg.y === 'number') section.y = msg.y;
+      if (typeof msg.width === 'number' && typeof msg.height === 'number') {
+        section.resizeWithoutConstraints(msg.width, msg.height);
+      }
+      if (msg.fillColor) {
+        var scHex = msg.fillColor.replace('#', '');
+        var scR = parseInt(scHex.substring(0, 2), 16) / 255;
+        var scG = parseInt(scHex.substring(2, 4), 16) / 255;
+        var scB = parseInt(scHex.substring(4, 6), 16) / 255;
+        section.fills = [{ type: 'SOLID', color: { r: scR, g: scG, b: scB } }];
+      }
+
+      figma.ui.postMessage({
+        type: 'CREATE_SECTION_RESULT',
+        requestId: msg.requestId,
+        success: true,
+        data: {
+          id: section.id,
+          type: section.type,
+          name: section.name,
+          x: section.x,
+          y: section.y,
+          width: section.width,
+          height: section.height
+        }
+      });
+
+    } catch (error) {
+      console.error('🌉 [Desktop Bridge] Create section error:', error);
+      figma.ui.postMessage({
+        type: 'CREATE_SECTION_RESULT',
+        requestId: msg.requestId,
+        success: false,
+        error: error.message || String(error)
+      });
+    }
+  }
+
   // CREATE_SHAPE_WITH_TEXT - Create a labeled shape
   else if (msg.type === 'CREATE_SHAPE_WITH_TEXT') {
     try {
@@ -3832,7 +6200,45 @@ figma.ui.onmessage = async (msg) => {
         shape.shapeType = msg.shapeType;
       }
 
-      // Set text
+      // Set position
+      if (typeof msg.x === 'number') shape.x = msg.x;
+      if (typeof msg.y === 'number') shape.y = msg.y;
+
+      // Resize (before text so text reflows to fit)
+      if (typeof msg.width === 'number' && typeof msg.height === 'number') {
+        shape.resize(msg.width, msg.height);
+      } else if (typeof msg.width === 'number') {
+        shape.resize(msg.width, shape.height);
+      } else if (typeof msg.height === 'number') {
+        shape.resize(shape.width, msg.height);
+      }
+
+      // Fill color
+      if (msg.fillColor) {
+        var fHex = msg.fillColor.replace('#', '');
+        var fR = parseInt(fHex.substring(0, 2), 16) / 255;
+        var fG = parseInt(fHex.substring(2, 4), 16) / 255;
+        var fB = parseInt(fHex.substring(4, 6), 16) / 255;
+        shape.fills = [{ type: 'SOLID', color: { r: fR, g: fG, b: fB } }];
+      }
+
+      // Stroke color
+      if (msg.strokeColor) {
+        var sHex = msg.strokeColor.replace('#', '');
+        var sR = parseInt(sHex.substring(0, 2), 16) / 255;
+        var sG = parseInt(sHex.substring(2, 4), 16) / 255;
+        var sB = parseInt(sHex.substring(4, 6), 16) / 255;
+        shape.strokes = [{ type: 'SOLID', color: { r: sR, g: sG, b: sB } }];
+        shape.strokeWeight = 1;
+      }
+
+      // Dash pattern
+      if (msg.strokeDashPattern) {
+        var parts = msg.strokeDashPattern.split(',').map(function(p) { return parseFloat(p.trim()); });
+        shape.dashPattern = parts;
+      }
+
+      // Set text (after resize so text reflows to fit new size)
       if (msg.text) {
         try {
           await figma.loadFontAsync(shape.text.fontName);
@@ -3841,16 +6247,16 @@ figma.ui.onmessage = async (msg) => {
           shape.text.fontName = { family: 'Inter', style: 'Medium' };
         }
         shape.text.characters = msg.text;
+        if (typeof msg.fontSize === 'number') {
+          shape.text.fontSize = msg.fontSize;
+        }
       }
-
-      if (typeof msg.x === 'number') shape.x = msg.x;
-      if (typeof msg.y === 'number') shape.y = msg.y;
 
       figma.ui.postMessage({
         type: 'CREATE_SHAPE_WITH_TEXT_RESULT',
         requestId: msg.requestId,
         success: true,
-        data: { id: shape.id, type: shape.type, name: shape.name, x: shape.x, y: shape.y }
+        data: { id: shape.id, type: shape.type, name: shape.name, x: shape.x, y: shape.y, width: shape.width, height: shape.height }
       });
 
     } catch (error) {
@@ -4607,6 +7013,108 @@ figma.ui.onmessage = async (msg) => {
     }
   }
 
+  // GET_TEXT_STYLES - Get all local text styles
+  else if (msg.type === 'GET_TEXT_STYLES') {
+    try {
+      var textStyles = await figma.getLocalTextStylesAsync();
+      var styles = [];
+      for (var si = 0; si < textStyles.length; si++) {
+        var style = textStyles[si];
+        styles.push({
+          id: style.id,
+          name: style.name,
+          description: style.description || '',
+          fontSize: style.fontSize,
+          fontFamily: style.fontName ? style.fontName.family : 'unknown',
+          fontStyle: style.fontName ? style.fontName.style : 'unknown',
+          letterSpacing: style.letterSpacing,
+          lineHeight: style.lineHeight,
+          textCase: style.textCase,
+          textDecoration: style.textDecoration
+        });
+      }
+      console.log('🌉 [Desktop Bridge] Got ' + styles.length + ' text styles');
+
+      figma.ui.postMessage({
+        type: 'GET_TEXT_STYLES_RESULT',
+        requestId: msg.requestId,
+        success: true,
+        data: { styles: styles, count: styles.length }
+      });
+
+    } catch (error) {
+      console.error('🌉 [Desktop Bridge] Get text styles error:', error);
+      figma.ui.postMessage({
+        type: 'GET_TEXT_STYLES_RESULT',
+        requestId: msg.requestId,
+        success: false,
+        error: error.message || String(error)
+      });
+    }
+  }
+
+  // SET_SLIDE_BACKGROUND - Set slide background color
+  else if (msg.type === 'SET_SLIDE_BACKGROUND') {
+    try {
+      if (__editorType !== 'slides') {
+        throw new Error('SET_SLIDE_BACKGROUND is only available in Slides files');
+      }
+      var bgSlide = await figma.getNodeByIdAsync(msg.slideId);
+      if (!bgSlide || bgSlide.type !== 'SLIDE') {
+        throw new Error('Node ' + msg.slideId + ' is not a SLIDE');
+      }
+      console.log('🌉 [Desktop Bridge] Setting slide background:', bgSlide.name);
+
+      // Parse hex color
+      var bgHex = (msg.color || '#CCCCCC').replace('#', '');
+      var bgR = parseInt(bgHex.substring(0, 2), 16) / 255;
+      var bgG = parseInt(bgHex.substring(2, 4), 16) / 255;
+      var bgB = parseInt(bgHex.substring(4, 6), 16) / 255;
+      var bgColor = { r: bgR, g: bgG, b: bgB };
+
+      // Check if a background rectangle already exists
+      var existingBg = null;
+      for (var ci = 0; ci < bgSlide.children.length; ci++) {
+        var child = bgSlide.children[ci];
+        if (child.type === 'RECTANGLE' && child.name === 'Background' && child.width === 1920 && child.height === 1080) {
+          existingBg = child;
+          break;
+        }
+      }
+
+      if (existingBg) {
+        // Update existing background
+        existingBg.fills = [{ type: 'SOLID', color: bgColor }];
+      } else {
+        // Create new background rectangle
+        var bgRect = figma.createRectangle();
+        bgRect.name = 'Background';
+        bgRect.resize(1920, 1080);
+        bgRect.x = 0;
+        bgRect.y = 0;
+        bgRect.fills = [{ type: 'SOLID', color: bgColor }];
+        bgSlide.appendChild(bgRect);
+        bgSlide.insertChild(0, bgRect);
+      }
+
+      figma.ui.postMessage({
+        type: 'SET_SLIDE_BACKGROUND_RESULT',
+        requestId: msg.requestId,
+        success: true,
+        data: { slideId: bgSlide.id, color: msg.color, updated: !!existingBg }
+      });
+
+    } catch (error) {
+      console.error('🌉 [Desktop Bridge] Set slide background error:', error);
+      figma.ui.postMessage({
+        type: 'SET_SLIDE_BACKGROUND_RESULT',
+        requestId: msg.requestId,
+        success: false,
+        error: error.message || String(error)
+      });
+    }
+  }
+
   // ADD_TEXT_TO_SLIDE - Add a text node to a slide
   else if (msg.type === 'ADD_TEXT_TO_SLIDE') {
     try {
@@ -4620,11 +7128,37 @@ figma.ui.onmessage = async (msg) => {
       console.log('🌉 [Desktop Bridge] Adding text to slide:', textSlide.name);
 
       var textNode = figma.createText();
-      await figma.loadFontAsync({ family: 'Inter', style: 'Regular' });
+      var fontFamily = msg.fontFamily || 'Inter';
+      var fontStyle = msg.fontStyle || 'Regular';
+      var slideFont = await loadFontWithFallback(fontFamily, fontStyle);
+      textNode.fontName = slideFont;
       textNode.characters = msg.text || '';
       textNode.fontSize = msg.fontSize || 24;
       textNode.x = typeof msg.x === 'number' ? msg.x : 100;
       textNode.y = typeof msg.y === 'number' ? msg.y : 100;
+      if (msg.color) {
+        var hex = msg.color.replace('#', '');
+        var r = parseInt(hex.substring(0, 2), 16) / 255;
+        var g = parseInt(hex.substring(2, 4), 16) / 255;
+        var b = parseInt(hex.substring(4, 6), 16) / 255;
+        textNode.fills = [{ type: 'SOLID', color: { r: r, g: g, b: b } }];
+      }
+      if (msg.textAlign) {
+        textNode.textAlignHorizontal = msg.textAlign;
+      }
+      if (msg.width) {
+        textNode.resize(msg.width, textNode.height);
+        textNode.textAutoResize = 'HEIGHT';
+      }
+      if (typeof msg.lineHeight === 'number') {
+        textNode.lineHeight = { value: msg.lineHeight, unit: 'PIXELS' };
+      }
+      if (typeof msg.letterSpacing === 'number') {
+        textNode.letterSpacing = { value: msg.letterSpacing, unit: 'PIXELS' };
+      }
+      if (msg.textCase) {
+        textNode.textCase = msg.textCase;
+      }
       textSlide.appendChild(textNode);
 
       figma.ui.postMessage({
@@ -4712,6 +7246,12 @@ figma.loadAllPagesAsync().then(function() {
     var hasNodeChanges = false;
     var changedNodeIds = [];
 
+    // v1.25.0: also collect metadata-only changes (descriptions, annotations).
+    // These are properties that the REST API DOESN'T expose in version snapshots,
+    // so figma_diff_versions can't see them through REST alone. Forwarding them
+    // via the Plugin API + WebSocket is the only way to make them diff-visible.
+    var metadataChanges = [];
+
     for (var i = 0; i < event.documentChanges.length; i++) {
       var change = event.documentChanges[i];
       if (change.type === 'STYLE_CREATE' || change.type === 'STYLE_DELETE' || change.type === 'STYLE_PROPERTY_CHANGE') {
@@ -4722,6 +7262,48 @@ figma.loadAllPagesAsync().then(function() {
           changedNodeIds.push(change.id);
         }
       }
+
+      // Metadata change detection. PROPERTY_CHANGE includes a `properties` array
+      // listing which fields changed; we only snapshot the new value for the
+      // two fields Figma's REST never returns: `description` and `annotations`.
+      if (change.type === 'PROPERTY_CHANGE' && change.node && Array.isArray(change.properties)) {
+        for (var p = 0; p < change.properties.length; p++) {
+          var prop = change.properties[p];
+          if (prop === 'description' || prop === 'descriptionMarkdown' || prop === 'annotations') {
+            try {
+              var newValue = change.node[prop];
+              // Serialize annotations to plain JSON-safe form
+              if (prop === 'annotations' && Array.isArray(newValue)) {
+                newValue = newValue.map(function(a) {
+                  return {
+                    label: a.label || null,
+                    labelMarkdown: a.labelMarkdown || null,
+                    categoryId: a.categoryId || null,
+                    properties: a.properties || []
+                  };
+                });
+              }
+              metadataChanges.push({
+                node_id: change.node.id,
+                node_name: change.node.name || null,
+                node_type: change.node.type || null,
+                field: prop === 'descriptionMarkdown' ? 'description' : prop,
+                new_value: newValue,
+                timestamp: Date.now()
+              });
+            } catch (e) {
+              // Some property reads can throw on detached / deleted nodes
+            }
+          }
+        }
+      }
+    }
+
+    if (metadataChanges.length > 0) {
+      figma.ui.postMessage({
+        type: 'METADATA_CHANGE',
+        data: { changes: metadataChanges }
+      });
     }
 
     if (hasStyleChanges || hasNodeChanges) {
@@ -4789,4 +7371,4 @@ console.log('🌉 [Desktop Bridge] Ready to handle component requests');
 console.log('🌉 [Desktop Bridge] Plugin will stay open until manually closed');
 
 // Plugin stays open - no auto-close
-// UI iframe remains accessible for Puppeteer to read data from window object
+// UI iframe remains accessible so the in-iframe WebSocket bridge client can keep relaying state to the MCP server

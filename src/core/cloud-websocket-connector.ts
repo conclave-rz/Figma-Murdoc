@@ -32,7 +32,7 @@ export class CloudWebSocketConnector implements IFigmaConnector {
 		}
 	}
 
-	getTransportType(): 'cdp' | 'websocket' {
+	getTransportType(): 'websocket' {
 		return 'websocket';
 	}
 
@@ -49,30 +49,45 @@ export class CloudWebSocketConnector implements IFigmaConnector {
 	}
 
 	async getVariables(fileKey?: string): Promise<any> {
+		// IMPORTANT: bare try/catch with top-level `return`, NO inner IIFE.
+		// See issue #68 + the matching note in websocket-connector.ts. The plugin
+		// (code.js) wraps every EXECUTE_CODE payload in its own async IIFE; nesting
+		// another swallows the inner return and silently drops the variables.
 		const code = `
-      (async () => {
-        try {
-          if (typeof figma === 'undefined') {
-            throw new Error('Figma API not available in this context');
-          }
-          const variables = await figma.variables.getLocalVariablesAsync();
-          const collections = await figma.variables.getLocalVariableCollectionsAsync();
-          return {
-            success: true,
-            timestamp: Date.now(),
-            fileMetadata: { fileName: figma.root.name, fileKey: figma.fileKey || null },
-            variables: variables.map(function(v) { return { id: v.id, name: v.name, key: v.key, resolvedType: v.resolvedType, valuesByMode: v.valuesByMode, variableCollectionId: v.variableCollectionId, scopes: v.scopes, description: v.description, hiddenFromPublishing: v.hiddenFromPublishing }; }),
-            variableCollections: collections.map(function(c) { return { id: c.id, name: c.name, key: c.key, modes: c.modes, defaultModeId: c.defaultModeId, variableIds: c.variableIds }; })
-          };
-        } catch (error) {
-          return { success: false, error: error.message };
+      try {
+        if (typeof figma === 'undefined') {
+          throw new Error('Figma API not available in this context');
         }
-      })()
+        const variables = await figma.variables.getLocalVariablesAsync();
+        const collections = await figma.variables.getLocalVariableCollectionsAsync();
+        return {
+          success: true,
+          timestamp: Date.now(),
+          fileMetadata: { fileName: figma.root.name, fileKey: figma.fileKey || null },
+          variables: variables.map(function(v) { return { id: v.id, name: v.name, key: v.key, resolvedType: v.resolvedType, valuesByMode: v.valuesByMode, variableCollectionId: v.variableCollectionId, scopes: v.scopes, description: v.description, hiddenFromPublishing: v.hiddenFromPublishing }; }),
+          variableCollections: collections.map(function(c) { return { id: c.id, name: c.name, key: c.key, modes: c.modes, defaultModeId: c.defaultModeId, variableIds: c.variableIds }; })
+        };
+      } catch (error) {
+        return { success: false, error: error.message };
+      }
     `;
 		return this.sendCommand('EXECUTE_CODE', { code, timeout: 30000 }, 32000);
 	}
 
-	async executeCodeViaUI(code: string, timeoutMs = 5000): Promise<any> {
+	async executeCodeViaUI(code: string, timeoutMs = 5000, fileKey?: string): Promise<any> {
+		// fileKey exists for IFigmaConnector parity but cannot be honored here —
+		// the cloud relay pairs with exactly one plugin instance, so there is no
+		// multi-file target to route between (matches getVariables* above).
+		// Reject rather than silently running against the paired file: a caller
+		// that asked for file B and got a successful write to file A has no way
+		// to tell from the response that it was misrouted.
+		if (fileKey) {
+			throw new Error(
+				'Per-file targeting (fileKey) is Local Mode only. Cloud Mode pairs with a single ' +
+				'plugin instance, so there is no second file to route to. Omit fileKey to run ' +
+				'against the paired file, or use Local Mode (NPX/Git) for multi-file work.'
+			);
+		}
 		return this.sendCommand('EXECUTE_CODE', { code, timeout: timeoutMs }, timeoutMs + 2000);
 	}
 
@@ -152,7 +167,9 @@ export class CloudWebSocketConnector implements IFigmaConnector {
 	// Component operations
 	// ============================================================================
 
-	async getComponentFromPluginUI(nodeId: string): Promise<any> {
+	// Cloud Mode pairs with exactly one plugin instance, so there is no other file to
+	// confuse it with — `fileKey` is accepted for interface parity and unused.
+	async getComponentFromPluginUI(nodeId: string, _fileKey?: string): Promise<any> {
 		return this.sendCommand('GET_COMPONENT', { nodeId }, 10000);
 	}
 
@@ -197,6 +214,7 @@ export class CloudWebSocketConnector implements IFigmaConnector {
 	): Promise<any> {
 		const params: any = { nodeId, propertyName, propertyType: type, defaultValue };
 		if (options?.preferredValues) params.preferredValues = options.preferredValues;
+		if (options?.description) params.description = options.description;
 		return this.sendCommand('ADD_COMPONENT_PROPERTY', params);
 	}
 
@@ -219,6 +237,61 @@ export class CloudWebSocketConnector implements IFigmaConnector {
 			if (options.parentId) params.parentId = options.parentId;
 		}
 		return this.sendCommand('INSTANTIATE_COMPONENT', params);
+	}
+
+	async createComponentSet(params: {
+		baseComponentId?: string;
+		properties?: Record<string, string[]>;
+		componentIds?: string[];
+		variantProperties?: Array<Record<string, string>>;
+		name?: string;
+		parentId?: string;
+		position?: { x: number; y: number };
+	}): Promise<any> {
+		// Timeout scales with variant count — the plugin builds all variants in
+		// one uncancellable pass, so a fixed 30s ceiling on big matrices reports
+		// failure while the set still gets created (retry → duplicates).
+		// Mirrors componentSetTimeoutMs in websocket-connector.ts (not imported:
+		// that module pulls the Node 'ws' stack into the Workers bundle).
+		let variantCount = 1;
+		if (params.componentIds?.length) {
+			variantCount = params.componentIds.length;
+		} else if (params.properties) {
+			for (const values of Object.values(params.properties)) {
+				variantCount *= Math.max(1, values?.length ?? 1);
+			}
+		}
+		const timeout = Math.min(120000, Math.max(30000, variantCount * 1200)) + 5000;
+		return this.sendCommand('CREATE_COMPONENT_SET', params, timeout);
+	}
+
+	// ============================================================================
+	// Slot operations
+	// ============================================================================
+
+	async createSlot(nodeId: string, options?: { name?: string; width?: number; height?: number; layoutMode?: string }): Promise<any> {
+		return this.sendCommand('CREATE_SLOT', { nodeId, ...options });
+	}
+
+	async getSlots(nodeId: string): Promise<any> {
+		return this.sendCommand('GET_SLOTS', { nodeId });
+	}
+
+	async appendToSlot(params: {
+		slotId?: string;
+		instanceId?: string;
+		slotName?: string;
+		sourceNodeId?: string;
+		nodeType?: string;
+		properties?: Record<string, string | number>;
+		clone?: boolean;
+		clearExisting?: boolean;
+	}): Promise<any> {
+		return this.sendCommand('APPEND_TO_SLOT', params);
+	}
+
+	async resetSlot(params: { slotId?: string; instanceId?: string; slotName?: string }): Promise<any> {
+		return this.sendCommand('RESET_SLOT', params);
 	}
 
 	// ============================================================================
@@ -269,6 +342,7 @@ export class CloudWebSocketConnector implements IFigmaConnector {
 			if (options.fontSize) params.fontSize = options.fontSize;
 			if (options.fontWeight) params.fontWeight = options.fontWeight;
 			if (options.fontFamily) params.fontFamily = options.fontFamily;
+			if (options.fontStyle) params.fontStyle = options.fontStyle;
 		}
 		return this.sendCommand('SET_TEXT_CONTENT', params);
 	}
@@ -314,6 +388,17 @@ export class CloudWebSocketConnector implements IFigmaConnector {
 	}
 
 	// ============================================================================
+	// Component accessibility audit
+	// ============================================================================
+
+	async auditComponentAccessibility(nodeId?: string, targetSize?: number): Promise<any> {
+		const params: any = {};
+		if (nodeId) params.nodeId = nodeId;
+		if (targetSize !== undefined) params.targetSize = targetSize;
+		return this.sendCommand('AUDIT_COMPONENT_ACCESSIBILITY', params, 120000);
+	}
+
+	// ============================================================================
 	// FigJam operations
 	// ============================================================================
 
@@ -325,12 +410,16 @@ export class CloudWebSocketConnector implements IFigmaConnector {
 		return this.sendCommand('CREATE_STICKIES', params, 30000);
 	}
 
-	async createConnector(params: { startNodeId: string; endNodeId: string; label?: string }): Promise<any> {
+	async createConnector(params: { startNodeId: string; endNodeId: string; label?: string; startMagnet?: string; endMagnet?: string }): Promise<any> {
 		return this.sendCommand('CREATE_CONNECTOR', params);
 	}
 
-	async createShapeWithText(params: { text?: string; shapeType?: string; x?: number; y?: number }): Promise<any> {
+	async createShapeWithText(params: { text?: string; shapeType?: string; x?: number; y?: number; width?: number; height?: number; fillColor?: string; strokeColor?: string; fontSize?: number; strokeDashPattern?: string }): Promise<any> {
 		return this.sendCommand('CREATE_SHAPE_WITH_TEXT', params);
+	}
+
+	async createSection(params: { name?: string; x?: number; y?: number; width?: number; height?: number; fillColor?: string }): Promise<any> {
+		return this.sendCommand('CREATE_SECTION', params);
 	}
 
 	async createTable(params: { rows: number; columns: number; data?: string[][]; x?: number; y?: number }): Promise<any> {
@@ -405,12 +494,20 @@ export class CloudWebSocketConnector implements IFigmaConnector {
 		return this.sendCommand('SKIP_SLIDE', params, 5000);
 	}
 
-	async addTextToSlide(params: { slideId: string; text: string; x?: number; y?: number; fontSize?: number }): Promise<any> {
+	async addTextToSlide(params: { slideId: string; text: string; x?: number; y?: number; fontSize?: number; fontFamily?: string; fontStyle?: string; color?: string; textAlign?: string; width?: number; lineHeight?: number; letterSpacing?: number; textCase?: string }): Promise<any> {
 		return this.sendCommand('ADD_TEXT_TO_SLIDE', params, 10000);
 	}
 
 	async addShapeToSlide(params: { slideId: string; shapeType: string; x: number; y: number; width: number; height: number; fillColor?: string }): Promise<any> {
 		return this.sendCommand('ADD_SHAPE_TO_SLIDE', params, 5000);
+	}
+
+	async setSlideBackground(params: { slideId: string; color: string }): Promise<any> {
+		return this.sendCommand('SET_SLIDE_BACKGROUND', params, 5000);
+	}
+
+	async getTextStyles(): Promise<any> {
+		return this.sendCommand('GET_TEXT_STYLES', {}, 5000);
 	}
 
 	// ============================================================================

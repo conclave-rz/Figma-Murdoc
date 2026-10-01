@@ -24,19 +24,27 @@ Without MCP, AI assistants are limited to what they already know. With MCP, they
 
 ## What is Figma Console MCP?
 
-**Figma Console MCP** is a specific MCP server that connects AI assistants to Figma. It transforms your design system from static files into a queryable API.
+**Figma Console MCP** is an MCP server for working with design systems in Figma. It does four things:
+
+1. **Works in both directions.** It moves design tokens from Figma to code and back, turns an existing codebase into a design system you can bring into Figma, and compares Figma components with their code.
+2. **Writes to Figma.** It creates and edits variables, components, component sets, Slots, annotations, FigJam boards, and Slides, and can run any Figma Plugin API code.
+3. **Runs deterministic checks.** Rule-based checks for design-code parity, accessibility, and design-system health give the same result every time, so you can rely on them before a release.
+4. **Gives the AI facts to write code from.** It returns exact token names and values, variants, variable bindings, and states as structured data. It doesn't push a framework or coding style, so the code the AI writes follows your team's own stack and conventions.
 
 ### What it enables:
 
-<Columns cols={3}>
+<Columns cols={2}>
   <Card title="Extract" icon="download">
     Pull design tokens, components, and styles as structured data
+  </Card>
+  <Card title="Sync" icon="arrows-rotate">
+    Bidirectional token sync between Figma and your codebase (10 export formats, DTCG import)
   </Card>
   <Card title="Create" icon="wand-magic-sparkles">
     Build UI components and layouts directly in Figma through conversation
   </Card>
-  <Card title="Debug" icon="bug">
-    Capture console logs, errors, and screenshots from Figma plugins
+  <Card title="Audit" icon="universal-access">
+    Accessibility scanning with WCAG checks, component scorecards, and code analysis
   </Card>
 </Columns>
 
@@ -126,20 +134,20 @@ Figma Console MCP makes this real. Your design system becomes:
     "Get the Button component specs and implement it in React using our design tokens"
     ```
   </Tab>
-  <Tab title="Plugin Developers">
-    ### Debug Plugins Without the DevTools Hassle
+  <Tab title="Accessibility">
+    ### Full-Spectrum Accessibility Scanning
 
-    Real-time console access, right in your AI chat.
+    WCAG coverage across design and code, without maintaining a rule database.
 
     **With Figma Console MCP, you can:**
-    - Stream console logs in real-time
-    - Capture errors with full stack traces
-    - Take screenshots of plugin UI state
-    - Test without constantly switching windows
+    - Lint designs for 14 WCAG checks with AA/best-practice level tagging
+    - Audit components for state coverage, focus quality, and color-blind safety
+    - Scan HTML code with axe-core (104 rules) for ARIA, labels, and semantics
+    - Compare design intent vs code implementation with parity checks
 
     **Example prompt:**
     ```
-    "Watch console logs for 30 seconds while I test my plugin"
+    "Run an accessibility audit on the Button component and scan the code for issues"
     ```
   </Tab>
   <Tab title="Design System Teams">
@@ -174,7 +182,7 @@ Figma Console MCP makes this real. Your design system becomes:
 
 ### Recommended: NPX Setup (Full Capabilities)
 
-Get all 90+ tools including design creation, variable management, and component instantiation.
+Get all 121 tools including design creation, variable management, and component instantiation.
 
 <Steps>
   <Step title="Get a Figma Token">
@@ -193,7 +201,7 @@ Get all 90+ tools including design creation, variable management, and component 
 
 ### Cloud Mode (Web AI Clients)
 
-Using Claude.ai, v0, Replit, or Lovable? Get full write access (((79 tools))) without installing Node.js.
+Using Claude.ai, v0, Replit, or Lovable? Get full write access (96 tools) without installing Node.js.
 
 <Steps>
   <Step title="Run the Desktop Bridge Plugin">
@@ -209,7 +217,7 @@ Using Claude.ai, v0, Replit, or Lovable? Get full write access (((79 tools))) wi
 
 ### Remote Mode (Read-Only)
 
-If you just want to explore or evaluate the tool, use Remote Mode. It's read-only (79 tools) but requires zero setup.
+If you just want to explore or evaluate the tool, use Remote Mode. It's read-only but requires zero setup.
 
 <Steps>
   <Step title="Open Claude Desktop Settings">
@@ -221,7 +229,7 @@ If you just want to explore or evaluate the tool, use Remote Mode. It's read-onl
 </Steps>
 
 <Warning>
-**Remote mode without pairing is read-only** (79 tools). For write access from web AI clients, use Cloud Mode above. For full capabilities with real-time monitoring, use NPX Setup.
+**Remote mode without pairing is read-only.** For write access from web AI clients, use Cloud Mode above. For full capabilities with real-time monitoring, use NPX Setup.
 </Warning>
 
 <Card title="Full Setup Guide" icon="book-open" href="/setup">
@@ -258,14 +266,14 @@ Get the Card component specs and help me implement it in React
 What's the spacing between elements in the navigation bar?
 ```
 
-### Plugin Debugging
+### Accessibility Scanning
 
 ```
-Watch console logs for 60 seconds while I test my plugin
+Run an accessibility check on this page and show me all WCAG violations
 ```
 
 ```
-Show me only error logs from the last 5 minutes
+Audit the Button component for accessibility completeness and color-blind safety
 ```
 
 ### Design Creation (Local & Cloud Mode)
@@ -286,13 +294,13 @@ Figma Console MCP offers three connection tiers with different capabilities:
 
 | Feature | Local (NPX/Git) | Cloud Mode | Remote (Read-Only) |
 |---------|-----------------|------------|-------------------|
-| **Total tools** | **90+** | **44** | **15** |
+| **Total tools** | **121** | **96** after pairing | Read-only subset |
 | **Setup** | ~10 minutes | ~5 minutes | ~2 minutes |
 | **Create designs** | ✅ | ✅ | ❌ |
 | **Edit designs** | ✅ | ✅ | ❌ |
 | **Manage variables** | ✅ | ✅ | ❌ |
 | **Read design data** | ✅ | ✅ | ✅ |
-| **Real-time monitoring** | ✅ | ❌ | ❌ |
+| **Accessibility scanning** | ✅ | ✅ | ❌ |
 | **Variables on any plan** | ✅ | ✅ | Enterprise only |
 | **Requires Node.js** | Yes | No | No |
 
@@ -315,8 +323,8 @@ Figma Console MCP offers three connection tiers with different capabilities:
     Yes. Remote mode uses OAuth (the same secure login as "Sign in with Google"). Your credentials are never shared with the MCP server—only temporary access tokens. Local mode keeps everything on your machine.
   </Accordion>
 
-  <Accordion title="Does this replace Figma's official Dev Mode MCP?">
-    No—they're complementary! Figma's official MCP generates code from designs. Figma Console MCP extracts raw data, debugs plugins, and creates designs. Use both for the complete workflow.
+  <Accordion title="Does this replace Figma's official MCP server?">
+    No. They're complementary, and you can run both in the same client. Figma's official MCP server focuses on design-to-code context, Code Connect, and creating content in Figma. Figma Console MCP focuses on design-system operations: token sync, parity and accessibility checks, health audits, component documentation, and version history. See [Figma MCP vs. Figma Console MCP](/figma-mcp-vs-figma-console-mcp).
   </Accordion>
 
   <Accordion title="What AI assistants work with this?">
@@ -344,7 +352,7 @@ Figma Console MCP offers three connection tiers with different capabilities:
     Real-world examples and workflows
   </Card>
   <Card title="All Tools" icon="wrench" href="/tools">
-    Complete reference for 90+ tools
+    Complete reference for 121 tools
   </Card>
 </Columns>
 

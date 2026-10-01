@@ -17,46 +17,103 @@ import { WebSocketServer as WSServer, WebSocket } from 'ws';
 import { EventEmitter } from 'events';
 import { createServer as createHttpServer, IncomingMessage, ServerResponse } from 'http';
 import type { Server as HttpServer } from 'http';
-import { readFileSync, existsSync } from 'fs';
+import { readFileSync } from 'fs';
 import { join } from 'path';
 import { createChildLogger } from './logger.js';
+import { PACKAGE_ROOT } from './resolve-package-root.js';
 import type { ConsoleLogEntry } from './types/index.js';
 
-// Read version from package.json
-// Uses __dirname in CJS/Jest context, falls back to process.cwd() in ESM runtime
+// Read version from package.json using the resolved package root.
+// PACKAGE_ROOT uses import.meta.url in ESM (production) and __dirname in CJS (Jest).
 let SERVER_VERSION = '0.0.0';
 try {
-  const base = typeof __dirname !== 'undefined' ? join(__dirname, '..', '..') : process.cwd();
-  SERVER_VERSION = JSON.parse(readFileSync(join(base, 'package.json'), 'utf-8')).version;
+  SERVER_VERSION = JSON.parse(readFileSync(join(PACKAGE_ROOT, 'package.json'), 'utf-8')).version;
 } catch {
   // Non-critical — version will show as 0.0.0
 }
 
+/** This package's version, as published — what MCP clients are told in `initialize`. */
+export function getServerVersion(): string {
+  return SERVER_VERSION;
+}
+
 /**
- * Load the full plugin UI HTML content that gets served to the bootloader.
- * Falls back to a minimal error page if the file isn't found.
+ * Extract the PLUGIN_VERSION constant from figma-desktop-bridge/code.js source.
+ * Returns null when the constant is absent or malformed.
  */
-function loadPluginUIContent(): string {
-  const candidates = [
-    // ESM runtime: dist/core/ → ../../figma-desktop-bridge/
-    typeof __dirname !== 'undefined'
-      ? join(__dirname, '..', '..', 'figma-desktop-bridge', 'ui-full.html')
-      : join(process.cwd(), 'figma-desktop-bridge', 'ui-full.html'),
-    // Direct from project root
-    join(process.cwd(), 'figma-desktop-bridge', 'ui-full.html'),
-  ];
+export function parseBundledPluginVersion(codeJsSource: string): string | null {
+  const match = codeJsSource.match(/var PLUGIN_VERSION\s*=\s*'(\d+\.\d+\.\d+)'/);
+  return match ? match[1] : null;
+}
 
-  for (const path of candidates) {
-    try {
-      if (existsSync(path)) {
-        return readFileSync(path, 'utf-8');
-      }
-    } catch {
-      // try next candidate
-    }
+// The version of the plugin files THIS package ships — i.e. what a manifest
+// re-import would install. This is deliberately NOT the package version:
+// server-only releases (deps, docs, server code) bump package.json without
+// touching figma-desktop-bridge/, and comparing the plugin against
+// SERVER_VERSION would falsely nag users to re-import an already-current
+// plugin (seen live: plugin 1.33.0 + server 1.33.1 → spurious update banner).
+let BUNDLED_PLUGIN_VERSION = SERVER_VERSION;
+try {
+  const parsed = parseBundledPluginVersion(
+    readFileSync(join(PACKAGE_ROOT, 'figma-desktop-bridge', 'code.js'), 'utf-8')
+  );
+  if (parsed) BUNDLED_PLUGIN_VERSION = parsed;
+} catch {
+  // Non-critical — fall back to SERVER_VERSION (pre-v1.33.2 behavior)
+}
+
+/** Version of the plugin files bundled with this server (what a re-import installs). */
+export function getBundledPluginVersion(): string {
+  return BUNDLED_PLUGIN_VERSION;
+}
+
+/**
+ * Compare two `major.minor.patch` strings. Returns <0 when a precedes b, 0 when
+ * equal, >0 when a follows b, and null when either side isn't parseable.
+ */
+export function compareSemver(a: string, b: string): number | null {
+  const parse = (v: string): number[] | null => {
+    const parts = v.trim().split('.');
+    if (parts.length !== 3) return null;
+    const nums = parts.map((p) => Number(p));
+    return nums.every((n) => Number.isInteger(n) && n >= 0) ? nums : null;
+  };
+  const pa = parse(a);
+  const pb = parse(b);
+  if (!pa || !pb) return null;
+  for (let i = 0; i < 3; i++) {
+    if (pa[i] !== pb[i]) return pa[i] - pb[i];
   }
+  return 0;
+}
 
-  return '<html><body><p>Plugin UI not found. Please reinstall figma-console-mcp.</p></body></html>';
+/**
+ * A plugin needs re-importing when it reports no version (predates version
+ * reporting) or an OLDER version than the plugin files this server ships.
+ * The server's own package version is irrelevant here.
+ *
+ * The direction matters. This used to be a bare `!==`, which also fired when
+ * the connected plugin was NEWER than the server's bundled copy — telling the
+ * user to re-import, which can only ever install the same or a newer plugin,
+ * so the banner could never be cleared. That is not a rare state: the port
+ * range means several server instances run at once, and during an upgrade the
+ * older ones keep an outdated BUNDLED_PLUGIN_VERSION in memory (it is parsed
+ * once at module load) while the freshly re-imported plugin is already current.
+ * Every stale server then nags a correctly-updated plugin. Observed live on
+ * v1.39.0 with four leftover v1.38.2 servers.
+ *
+ * An older server has nothing to offer a newer plugin, so it stays quiet.
+ */
+export function computePluginUpdateAvailable(
+  pluginVersion: string | null,
+  bundledPluginVersion: string
+): boolean {
+  if (!pluginVersion) return true;
+  const cmp = compareSemver(pluginVersion, bundledPluginVersion);
+  // Unparseable on either side — fall back to the conservative inequality so a
+  // genuinely odd plugin build still prompts rather than passing silently.
+  if (cmp === null) return pluginVersion !== bundledPluginVersion;
+  return cmp < 0;
 }
 
 const logger = createChildLogger({ component: 'websocket-server' });
@@ -64,6 +121,12 @@ const logger = createChildLogger({ component: 'websocket-server' });
 export interface WebSocketServerOptions {
   port: number;
   host?: string;
+  /**
+   * Version of the plugin files shipped with this server, used for the
+   * FILE_INFO version handshake. Defaults to the PLUGIN_VERSION parsed from
+   * the packaged figma-desktop-bridge/code.js. Overridable for tests.
+   */
+  bundledPluginVersion?: string;
 }
 
 interface PendingRequest {
@@ -82,6 +145,10 @@ export interface ConnectedFileInfo {
   currentPageId?: string;
   editorType?: 'figma' | 'figjam' | 'dev';
   connectedAt: number;
+  /** Version reported by the imported plugin's code.js (FILE_INFO). Null when the plugin predates version reporting. */
+  pluginVersion?: string | null;
+  /** True when the imported plugin's version differs from the plugin files bundled with this server — the user should re-import manifest.json. */
+  pluginUpdateAvailable?: boolean;
 }
 
 export interface SelectionInfo {
@@ -106,6 +173,28 @@ export interface DocumentChangeEntry {
 }
 
 /**
+ * v1.25.0: A single metadata-only change captured by the plugin and forwarded
+ * over the WebSocket. Tracks the two fields Figma REST never exposes in version
+ * snapshots — `description` and `annotations` — so `figma_diff_versions` can
+ * surface them by correlating buffer entries to the diff time window.
+ *
+ * The plugin captures these on `figma.on('documentchange')` when a PROPERTY_CHANGE
+ * touches one of those fields. Only the NEW value is captured (Figma's event
+ * doesn't include before/after). The diff engine treats the from-version's
+ * value as "whatever it was at the start of the window" — buffer entries
+ * within the window are interpreted as "during this version range, the field
+ * was edited; final value at end of window is shown."
+ */
+export interface MetadataChangeEntry {
+  node_id: string;
+  node_name: string | null;
+  node_type: string | null;
+  field: 'description' | 'annotations';
+  new_value: any;
+  timestamp: number;
+}
+
+/**
  * Per-file client connection state.
  * Each Figma file with the Desktop Bridge plugin open gets its own ClientConnection.
  */
@@ -114,8 +203,11 @@ export interface ClientConnection {
   fileInfo: ConnectedFileInfo;
   selection: SelectionInfo | null;
   documentChanges: DocumentChangeEntry[];
+  /** v1.25.0: per-file ring buffer of description/annotation change events */
+  metadataChanges: MetadataChangeEntry[];
   consoleLogs: ConsoleLogEntry[];
   lastActivity: number;
+  lastPongAt: number;
   gracePeriodTimer: ReturnType<typeof setTimeout> | null;
 }
 
@@ -128,6 +220,14 @@ export class FigmaWebSocketServer extends EventEmitter {
   private _pendingClients: Map<WebSocket, ReturnType<typeof setTimeout>> = new Map();
   /** The fileKey of the currently active (targeted) file */
   private _activeFileKey: string | null = null;
+  /**
+   * When true, the active file is pinned: new connections, reconnects, and
+   * user interaction (selection/page changes) will NOT move the active target.
+   * Lets the agent work in one file while the user works in another without
+   * commands silently routing to the wrong file. Cleared if the locked file
+   * disconnects.
+   */
+  private _targetLocked = false;
   private pendingRequests: Map<string, PendingRequest> = new Map();
   private requestIdCounter = 0;
   private options: WebSocketServerOptions;
@@ -135,8 +235,8 @@ export class FigmaWebSocketServer extends EventEmitter {
   private _startedAt = Date.now();
   private consoleBufferSize = 1000;
   private documentChangeBufferSize = 200;
-  /** Cached plugin UI HTML content — loaded once and served to bootloader requests */
-  private _pluginUIContent: string | null = null;
+  /** Heartbeat interval for detecting dead connections via ping/pong */
+  private _heartbeatInterval: ReturnType<typeof setInterval> | null = null;
 
   constructor(options: WebSocketServerOptions) {
     super();
@@ -146,7 +246,10 @@ export class FigmaWebSocketServer extends EventEmitter {
 
   /**
    * Handle HTTP requests on the same port as WebSocket.
-   * Serves plugin UI content for the bootloader and health checks.
+   * Serves a JSON `/health` (also at `/`) endpoint with version and connected-file
+   * info. No plugin-UI route exists — the plugin loads its own `ui.html` from disk
+   * via the Figma plugin runtime; the legacy `/plugin/ui` bootloader endpoint was
+   * removed in the Phase 3 cleanup.
    */
   private handleHttpRequest(req: IncomingMessage, res: ServerResponse): void {
     // CORS headers for Figma plugin iframe (sandboxed, origin: null)
@@ -162,27 +265,19 @@ export class FigmaWebSocketServer extends EventEmitter {
 
     const url = req.url || '/';
 
-    // Plugin UI endpoint — bootloader redirects here
-    if (url === '/plugin/ui' || url === '/plugin/ui/') {
-      if (!this._pluginUIContent) {
-        this._pluginUIContent = loadPluginUIContent();
-      }
-      res.writeHead(200, {
-        'Content-Type': 'text/html; charset=utf-8',
-        'Cache-Control': 'no-cache, no-store, must-revalidate',
-      });
-      res.end(this._pluginUIContent);
-      return;
-    }
-
     // Health/version endpoint
     if (url === '/health' || url === '/') {
+      const now = Date.now();
+      const connectedClients = Array.from(this.clients.values()).filter(
+        c => c.ws.readyState === WebSocket.OPEN && (now - c.lastPongAt) < 90000
+      ).length;
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         status: 'ok',
         version: SERVER_VERSION,
         clients: this.clients.size,
-        uptime: Math.floor((Date.now() - this._startedAt) / 1000),
+        connectedClients,
+        uptime: Math.floor((now - this._startedAt) / 1000),
       }));
       return;
     }
@@ -220,11 +315,13 @@ export class FigmaWebSocketServer extends EventEmitter {
             // Mitigate Cross-Site WebSocket Hijacking (CSWSH):
             // Reject connections from unexpected browser origins.
             const origin = info.origin;
+            // Exact match only — startsWith would let e.g.
+            // https://www.figma.com.attacker.example through.
             const allowed =
               !origin ||                           // No origin — local process (e.g. Node.js client)
               origin === 'null' ||                  // Sandboxed iframe / Figma Desktop plugin UI
-              origin.startsWith('https://www.figma.com') ||
-              origin.startsWith('https://figma.com');
+              origin === 'https://www.figma.com' ||
+              origin === 'https://figma.com';
             if (allowed) {
               callback(true);
             } else {
@@ -253,6 +350,7 @@ export class FigmaWebSocketServer extends EventEmitter {
         // Start listening on the HTTP server (which also handles WS upgrades)
         this.httpServer.listen(this.options.port, this.options.host || 'localhost', () => {
           this._isStarted = true;
+          this.startHeartbeat();
           logger.info(
             { port: this.options.port, host: this.options.host || 'localhost' },
             'WebSocket bridge server started (with HTTP plugin UI endpoint)'
@@ -317,6 +415,19 @@ export class FigmaWebSocketServer extends EventEmitter {
           ws.on('error', (error: any) => {
             logger.error({ error }, 'WebSocket client error');
           });
+
+          // Track pong responses for heartbeat-based liveness detection.
+          // Browser WebSocket clients auto-respond to pings per RFC 6455 —
+          // no plugin-side code changes needed.
+          (ws as any).isAlive = true;
+          ws.on('pong', () => {
+            (ws as any).isAlive = true;
+            // Update lastPongAt on the named client if identified
+            const found = this.findClientByWs(ws);
+            if (found) {
+              found.client.lastPongAt = Date.now();
+            }
+          });
         });
       } catch (error) {
         rejectOnce(error);
@@ -341,31 +452,39 @@ export class FigmaWebSocketServer extends EventEmitter {
     // Response to a command we sent
     if (message.id && this.pendingRequests.has(message.id)) {
       const pending = this.pendingRequests.get(message.id)!;
-      clearTimeout(pending.timeoutId);
-      this.pendingRequests.delete(message.id);
 
-      if (message.error) {
-        pending.reject(new Error(message.error));
+      // Verify the response arrived on the socket belonging to the file the
+      // command targeted — a matching id alone must not let a different
+      // client resolve (or spoof) another file's request.
+      const sender = this.findClientByWs(ws);
+      const socketVerified = sender
+        ? sender.fileKey === pending.targetFileKey
+        // Pre-identification socket (no FILE_INFO yet): only safe when it is
+        // unambiguous — exactly one socket connected to the server at all.
+        : (this.wss?.clients.size ?? 0) === 1;
+
+      if (!socketVerified) {
+        logger.warn(
+          {
+            id: message.id,
+            method: pending.method,
+            senderFileKey: sender?.fileKey ?? null,
+            targetFileKey: pending.targetFileKey,
+          },
+          'Ignoring response from unexpected socket (id matched, sender did not) — treating as unsolicited'
+        );
+        // Leave the pending request in place; fall through to unsolicited handling.
       } else {
-        pending.resolve(message.result);
-      }
-      return;
-    }
+        clearTimeout(pending.timeoutId);
+        this.pendingRequests.delete(message.id);
 
-    // Bootloader request: send the full plugin UI HTML
-    if (message.type === 'GET_PLUGIN_UI') {
-      if (!this._pluginUIContent) {
-        this._pluginUIContent = loadPluginUIContent();
+        if (message.error) {
+          pending.reject(new Error(message.error));
+        } else {
+          pending.resolve(message.result);
+        }
+        return;
       }
-      try {
-        ws.send(JSON.stringify({
-          type: 'PLUGIN_UI_CONTENT',
-          html: this._pluginUIContent,
-        }));
-      } catch {
-        // Non-critical — bootloader will show error
-      }
-      return;
     }
 
     // Unsolicited data from plugin (FILE_INFO, events, forwarded data)
@@ -395,13 +514,41 @@ export class FigmaWebSocketServer extends EventEmitter {
         this.emit('documentChange', { fileKey: found?.fileKey ?? null, ...message.data });
       }
 
+      // v1.25.0: buffer description/annotation changes for the specific file.
+      // These are the diff-engine blind spots that Figma REST doesn't expose;
+      // the diff engine consults this buffer when correlating to a version
+      // range, so changes made while the plugin was connected become visible.
+      if (message.type === 'METADATA_CHANGE' && message.data) {
+        const found = this.findClientByWs(ws);
+        if (found) {
+          const changes: any[] = Array.isArray(message.data.changes) ? message.data.changes : [];
+          for (const c of changes) {
+            if (!c || typeof c.node_id !== 'string' || !c.field) continue;
+            const entry: MetadataChangeEntry = {
+              node_id: c.node_id,
+              node_name: c.node_name ?? null,
+              node_type: c.node_type ?? null,
+              field: c.field === 'annotations' ? 'annotations' : 'description',
+              new_value: c.new_value,
+              timestamp: typeof c.timestamp === 'number' ? c.timestamp : Date.now(),
+            };
+            found.client.metadataChanges.push(entry);
+            if (found.client.metadataChanges.length > this.documentChangeBufferSize) {
+              found.client.metadataChanges.shift();
+            }
+          }
+          found.client.lastActivity = Date.now();
+        }
+        this.emit('metadataChange', { fileKey: found?.fileKey ?? null, changes: message.data.changes });
+      }
+
       // Track selection changes — user interaction makes this the active file
       if (message.type === 'SELECTION_CHANGE' && message.data) {
         const found = this.findClientByWs(ws);
         if (found) {
           found.client.selection = message.data as SelectionInfo;
           found.client.lastActivity = Date.now();
-          this._activeFileKey = found.fileKey;
+          if (!this._targetLocked) this._activeFileKey = found.fileKey;
         }
         this.emit('selectionChange', { fileKey: found?.fileKey ?? null, ...message.data });
       }
@@ -413,7 +560,7 @@ export class FigmaWebSocketServer extends EventEmitter {
           found.client.fileInfo.currentPage = message.data.pageName;
           found.client.fileInfo.currentPageId = message.data.pageId || null;
           found.client.lastActivity = Date.now();
-          this._activeFileKey = found.fileKey;
+          if (!this._targetLocked) this._activeFileKey = found.fileKey;
         }
         this.emit('pageChange', { fileKey: found?.fileKey ?? null, ...message.data });
       }
@@ -473,11 +620,22 @@ export class FigmaWebSocketServer extends EventEmitter {
       this.clients.delete(previousEntry.fileKey);
       if (this._activeFileKey === previousEntry.fileKey) {
         this._activeFileKey = null;
+        // The pinned plugin navigated to a different file — the old pin is
+        // meaningless, so release it rather than silently re-pinning the new file.
+        this._targetLocked = false;
       }
+      // In-flight commands to the old file can never receive a response now —
+      // reject them immediately instead of leaving them to hang until timeout
+      // (mirrors the same-file replacement path below).
+      this.rejectPendingRequestsForFile(previousEntry.fileKey, 'Plugin switched files');
       logger.info(
         { oldFileKey: previousEntry.fileKey, newFileKey: fileKey },
         'WebSocket client switched files'
       );
+      this.emit('fileDisconnected', {
+        fileKey: previousEntry.fileKey,
+        fileName: previousEntry.client.fileInfo.fileName,
+      });
     }
 
     // If same fileKey already connected with a DIFFERENT ws, clean up old connection
@@ -496,6 +654,39 @@ export class FigmaWebSocketServer extends EventEmitter {
       }
     }
 
+    // Version handshake: the plugin reports its code.js version in FILE_INFO.
+    // Figma caches plugin files at the app level, so a version mismatch means
+    // the user is running stale plugin code and must re-import manifest.json.
+    // A missing version means the plugin predates version reporting — also stale.
+    // Compared against the BUNDLED plugin version (what a re-import would
+    // install), NOT the server's package version — server-only releases don't
+    // change the plugin files, so they must not trigger the re-import banner.
+    const bundledPluginVersion =
+      this.options.bundledPluginVersion ?? BUNDLED_PLUGIN_VERSION;
+    const pluginVersion: string | null = data.pluginVersion || null;
+    const pluginUpdateAvailable = computePluginUpdateAvailable(
+      pluginVersion,
+      bundledPluginVersion
+    );
+    if (pluginUpdateAvailable) {
+      logger.warn(
+        { fileKey, pluginVersion, bundledPluginVersion, serverVersion: SERVER_VERSION },
+        'Imported plugin version differs from the plugin files bundled with this server — re-import manifest.json to update'
+      );
+      try {
+        ws.send(
+          JSON.stringify({
+            type: 'PLUGIN_UPDATE_AVAILABLE',
+            serverVersion: SERVER_VERSION,
+            bundledPluginVersion,
+            pluginVersion,
+          })
+        );
+      } catch {
+        // Non-critical notification — never let it disrupt registration
+      }
+    }
+
     // Create client connection (preserve per-file state from previous connection of same file)
     this.clients.set(fileKey, {
       ws,
@@ -506,18 +697,29 @@ export class FigmaWebSocketServer extends EventEmitter {
         currentPageId: data.currentPageId || null,
         editorType: data.editorType || 'figma',
         connectedAt: Date.now(),
+        pluginVersion,
+        pluginUpdateAvailable,
       },
       selection: existing?.selection || null,
       documentChanges: existing?.documentChanges || [],
+      metadataChanges: existing?.metadataChanges || [],
       consoleLogs: existing?.consoleLogs || [],
       lastActivity: Date.now(),
+      lastPongAt: Date.now(),
       gracePeriodTimer: null,
     });
 
     // Most recently connected file becomes active (user just opened the plugin there).
     // On bulk reconnect the order is non-deterministic, but the first user interaction
     // (SELECTION_CHANGE or PAGE_CHANGE) will correct the active file immediately.
-    this._activeFileKey = fileKey;
+    // Skip when the target is pinned so a new or reconnecting plugin can't steal it.
+    // Invariant: a locked target always has an active file — every path that nulls
+    // _activeFileKey also releases the lock — so there is no "locked but nothing
+    // active" case to re-adopt here, and a crash-reconnect within the grace window
+    // keeps its active key (the grace timer is cleared before it can fire).
+    if (!this._targetLocked) {
+      this._activeFileKey = fileKey;
+    }
 
     logger.info(
       {
@@ -572,9 +774,15 @@ export class FigmaWebSocketServer extends EventEmitter {
         this.clients.delete(fileKey);
         this.rejectPendingRequestsForFile(fileKey, 'WebSocket client disconnected');
 
-        // If active file disconnected, switch to another connected file
+        // If active file disconnected, switch to another connected file.
+        // Release any lock — the pinned file is gone, so honoring the lock
+        // would strand every command against a dead connection.
         if (this._activeFileKey === fileKey) {
           this._activeFileKey = null;
+          if (this._targetLocked) {
+            this._targetLocked = false;
+            logger.info({ fileKey }, 'Target lock released — locked file disconnected');
+          }
           for (const [fk, c] of this.clients) {
             if (c.ws.readyState === WebSocket.OPEN) {
               this._activeFileKey = fk;
@@ -643,11 +851,35 @@ export class FigmaWebSocketServer extends EventEmitter {
   }
 
   /**
-   * Check if any named client is connected (transport availability check)
+   * Start the heartbeat interval that pings all connected clients every 30s.
+   * Detects silently dropped connections (e.g., macOS sleep, network change)
+   * that the OS TCP keepalive would take 30-120s to catch.
+   * Browser WebSocket clients auto-respond to pings per RFC 6455.
+   */
+  private startHeartbeat(): void {
+    this._heartbeatInterval = setInterval(() => {
+      if (!this.wss) return;
+      for (const ws of this.wss.clients) {
+        if ((ws as any).isAlive === false) {
+          logger.info('Terminating unresponsive WebSocket client (missed heartbeat pong)');
+          ws.terminate();
+          continue;
+        }
+        (ws as any).isAlive = false;
+        ws.ping();
+      }
+    }, 30000);
+  }
+
+  /**
+   * Check if any named client is connected (transport availability check).
+   * Checks both socket readyState and heartbeat pong freshness to avoid
+   * reporting phantom-connected state on silently dropped connections.
    */
   isClientConnected(): boolean {
+    const now = Date.now();
     for (const [, client] of this.clients) {
-      if (client.ws.readyState === WebSocket.OPEN) {
+      if (client.ws.readyState === WebSocket.OPEN && (now - client.lastPongAt) < 90000) {
         return true;
       }
     }
@@ -740,6 +972,55 @@ export class FigmaWebSocketServer extends EventEmitter {
   }
 
   /**
+   * v1.25.0: Get buffered description/annotation change events for a file.
+   *
+   * Used by `figma_diff_versions` to surface changes that Figma REST doesn't
+   * expose. The diff engine passes a time window (from-version → to-version
+   * `last_modified` timestamps converted to Unix ms) and optional scoping by
+   * node IDs.
+   *
+   * Defaults to the active file if `fileKey` is omitted.
+   */
+  getMetadataChanges(options?: {
+    fileKey?: string;
+    since?: number;
+    until?: number;
+    nodeIds?: string[];
+  }): MetadataChangeEntry[] {
+    const fileKey = options?.fileKey ?? this._activeFileKey;
+    if (!fileKey) return [];
+    const client = this.clients.get(fileKey);
+    if (!client) return [];
+
+    let filtered = [...client.metadataChanges];
+
+    if (options?.since !== undefined) {
+      filtered = filtered.filter((e) => e.timestamp >= options.since!);
+    }
+    if (options?.until !== undefined) {
+      filtered = filtered.filter((e) => e.timestamp <= options.until!);
+    }
+    if (options?.nodeIds && options.nodeIds.length > 0) {
+      const set = new Set(options.nodeIds);
+      filtered = filtered.filter((e) => set.has(e.node_id));
+    }
+
+    return filtered;
+  }
+
+  /**
+   * v1.25.0: Clear metadata-change buffer for the active file.
+   */
+  clearMetadataChanges(): number {
+    if (!this._activeFileKey) return 0;
+    const client = this.clients.get(this._activeFileKey);
+    if (!client) return 0;
+    const count = client.metadataChanges.length;
+    client.metadataChanges = [];
+    return count;
+  }
+
+  /**
    * Get console logs from the active file with optional filtering
    */
   getConsoleLogs(options?: {
@@ -820,14 +1101,30 @@ export class FigmaWebSocketServer extends EventEmitter {
   }
 
   /**
-   * Set the active file by fileKey. Returns true if the file is connected.
+   * Get the last pong timestamp for the active client.
+   * Returns null if no active client or no pong received yet.
    */
-  setActiveFile(fileKey: string): boolean {
+  getActiveClientLastPongAt(): number | null {
+    if (!this._activeFileKey) return null;
+    const client = this.clients.get(this._activeFileKey);
+    return client?.lastPongAt ?? null;
+  }
+
+  /**
+   * Set the active file by fileKey. Returns true if the file is connected.
+   *
+   * Pass `lock: true` to pin the target so subsequent connections, reconnects,
+   * and user interaction won't move it. Any explicit switch resets the lock to
+   * the value passed here (default: unlocked), so switching without `lock`
+   * releases a prior lock.
+   */
+  setActiveFile(fileKey: string, lock = false): boolean {
     const client = this.clients.get(fileKey);
     if (client && client.ws.readyState === WebSocket.OPEN) {
       this._activeFileKey = fileKey;
-      logger.info({ fileKey, fileName: client.fileInfo.fileName }, 'Active file switched');
-      this.emit('activeFileChanged', { fileKey, fileName: client.fileInfo.fileName });
+      this._targetLocked = lock;
+      logger.info({ fileKey, fileName: client.fileInfo.fileName, locked: lock }, 'Active file switched');
+      this.emit('activeFileChanged', { fileKey, fileName: client.fileInfo.fileName, locked: lock });
       return true;
     }
     return false;
@@ -838,6 +1135,28 @@ export class FigmaWebSocketServer extends EventEmitter {
    */
   getActiveFileKey(): string | null {
     return this._activeFileKey;
+  }
+
+  /**
+   * Pin the current active file so connections, reconnects, and user
+   * interaction won't move the target. Returns false if no file is active.
+   */
+  lockTarget(): boolean {
+    if (!this._activeFileKey) return false;
+    this._targetLocked = true;
+    logger.info({ fileKey: this._activeFileKey }, 'Target locked');
+    return true;
+  }
+
+  /** Release the target lock; the active file resumes following user activity. */
+  unlockTarget(): void {
+    this._targetLocked = false;
+    logger.info({ fileKey: this._activeFileKey }, 'Target unlocked');
+  }
+
+  /** Whether the active file is currently pinned. */
+  isTargetLocked(): boolean {
+    return this._targetLocked;
   }
 
   /**
@@ -882,6 +1201,12 @@ export class FigmaWebSocketServer extends EventEmitter {
    * Stop the server and clean up all connections
    */
   async stop(): Promise<void> {
+    // Clear heartbeat interval
+    if (this._heartbeatInterval) {
+      clearInterval(this._heartbeatInterval);
+      this._heartbeatInterval = null;
+    }
+
     // Clear all per-client grace period timers
     for (const [, client] of this.clients) {
       if (client.gracePeriodTimer) {
@@ -906,6 +1231,7 @@ export class FigmaWebSocketServer extends EventEmitter {
     }
     this.clients.clear();
     this._activeFileKey = null;
+    this._targetLocked = false;
 
     // Close WS server first (handles WebSocket connections)
     if (this.wss) {

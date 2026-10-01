@@ -32,10 +32,10 @@ export interface CodeSpec {
 		gap?: number;
 		width?: number | string;
 		height?: number | string;
-		minWidth?: number;
-		minHeight?: number;
-		maxWidth?: number;
-		maxHeight?: number;
+		minWidth?: number | string;
+		minHeight?: number | string;
+		maxWidth?: number | string;
+		maxHeight?: number | string;
 		layoutDirection?: "horizontal" | "vertical";
 	};
 
@@ -80,6 +80,14 @@ export interface CodeSpec {
 		keyboardInteractions?: string[];
 		contrastRatio?: number;
 		focusVisible?: boolean;
+		/** Semantic HTML element used (e.g., 'button', 'a', 'input') */
+		semanticElement?: string;
+		/** Whether component supports disabled state (aria-disabled or disabled attr) */
+		supportsDisabled?: boolean;
+		/** Whether component has error/invalid state (aria-invalid) */
+		supportsError?: boolean;
+		/** Minimum rendered dimensions in px [width, height] */
+		renderedSize?: [number, number];
 	};
 
 	/** Metadata from code */
@@ -194,6 +202,8 @@ export interface CodeDocInfo {
 	}>;
 	/** Component file path */
 	filePath?: string;
+	/** URL of a running Storybook (or story) for this component */
+	storybookUrl?: string;
 	/** Package name */
 	packageName?: string;
 	/** CVA or variant definition code block */
@@ -258,6 +268,27 @@ export interface DocGenerationResult {
 		hasCodeInfo: boolean;
 		variablesIncluded: boolean;
 		stylesIncluded: boolean;
+	};
+	/** Present only when history was requested via the `history` parameter. */
+	historySummary?: {
+		design: {
+			requested: boolean;
+			entries: number;
+			versionsScanned: number;
+			apiCalls: number;
+			/** True when the file had no labeled versions and auto-saves were used. */
+			usedAutosaveFallback: boolean;
+			/** Raw version ID of the newest row — kept here since the rendered table shows dates. */
+			latestVersionId: string | null;
+			notes: string[];
+		} | null;
+		git: {
+			requested: boolean;
+			entries: number;
+			repoRoot: string | null;
+			paths: string[];
+			notes: string[];
+		} | null;
 	};
 	suggestedOutputPath: string;
 	ai_instruction: string;

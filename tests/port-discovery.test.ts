@@ -4,9 +4,10 @@
  * stale file cleanup, zombie detection, heartbeat, and multi-instance discovery.
  */
 
-import { existsSync, readFileSync, writeFileSync, unlinkSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdtempSync, rmSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
+import { spawn } from 'child_process';
 import { WebSocketServer as WSServer } from 'ws';
 import {
   DEFAULT_WS_PORT,
@@ -15,6 +16,10 @@ import {
   HEARTBEAT_STALE_MS,
   HEARTBEAT_INTERVAL_MS,
   EVICTION_MIN_AGE_MS,
+  TERMINATE_GRACE_MS,
+  ORPHAN_MIN_AGE_MS,
+  REAP_INTERVAL_MS,
+  KILL_ELIGIBLE_EXTRA_STALE_MS,
   getPortRange,
   getPortFilePath,
   advertisePort,
@@ -22,6 +27,10 @@ import {
   readPortFile,
   discoverActiveInstances,
   cleanupStalePortFiles,
+  cleanupStalePortFilesAsync,
+  cleanupOrphanedProcesses,
+  cleanupOrphanedProcessesAsync,
+  startPeriodicReaper,
   evictOldestInstance,
   refreshPortAdvertisement,
   isStaleInstance,
@@ -214,13 +223,17 @@ describe('Port Discovery Module', () => {
       expect(existsSync(getPortFilePath(TEST_PORT_BASE))).toBe(true);
     });
 
-    it('should clean up corrupt files', () => {
+    // Previously asserted that an unparseable file is deleted. That is the
+    // behaviour that stranded healthy servers: a reader hitting a file
+    // mid-rewrite sees partial JSON, indistinguishable from real corruption,
+    // and deleting it leaves a live port-holder with no port file — exactly
+    // what the orphan reaper terminates. Unreadable files are now left alone.
+    it('should NOT delete an unparseable file (may be a mid-write read)', () => {
       const filePath = getPortFilePath(TEST_PORT_BASE);
       writeFileSync(filePath, 'corrupt data');
 
-      const cleaned = cleanupStalePortFiles();
-      expect(cleaned).toBeGreaterThanOrEqual(1);
-      expect(existsSync(filePath)).toBe(false);
+      cleanupStalePortFiles();
+      expect(existsSync(filePath)).toBe(true);
     });
 
     it('should not terminate our own process even if stale', () => {
@@ -236,6 +249,52 @@ describe('Port Discovery Module', () => {
 
       // Should not clean up our own PID
       const cleaned = cleanupStalePortFiles();
+      // The file should still exist — we never terminate ourselves
+      expect(existsSync(filePath)).toBe(true);
+    });
+  });
+
+  describe('cleanupStalePortFilesAsync', () => {
+    it('should clean up files with dead PIDs', async () => {
+      const filePath = getPortFilePath(TEST_PORT_BASE);
+      writeFileSync(filePath, JSON.stringify({
+        port: TEST_PORT_BASE,
+        pid: 999999999,
+        host: 'localhost',
+        startedAt: new Date().toISOString(),
+      }));
+
+      const cleaned = await cleanupStalePortFilesAsync();
+      expect(cleaned).toBeGreaterThanOrEqual(1);
+      expect(existsSync(filePath)).toBe(false);
+    });
+
+    it('should not remove files with live PIDs and fresh heartbeat', async () => {
+      advertisePort(TEST_PORT_BASE, 'localhost');
+
+      await cleanupStalePortFilesAsync();
+      expect(existsSync(getPortFilePath(TEST_PORT_BASE))).toBe(true);
+    });
+
+    it('should NOT delete an unparseable file (may be a mid-write read)', async () => {
+      const filePath = getPortFilePath(TEST_PORT_BASE);
+      writeFileSync(filePath, 'corrupt data');
+
+      await cleanupStalePortFilesAsync();
+      expect(existsSync(filePath)).toBe(true);
+    });
+
+    it('should not terminate our own process even if stale', async () => {
+      const filePath = getPortFilePath(TEST_PORT_BASE);
+      writeFileSync(filePath, JSON.stringify({
+        port: TEST_PORT_BASE,
+        pid: process.pid,
+        host: 'localhost',
+        startedAt: new Date(Date.now() - 10 * 60 * 60 * 1000).toISOString(),
+        lastSeen: new Date(Date.now() - 10 * 60 * 1000).toISOString(),
+      }));
+
+      await cleanupStalePortFilesAsync();
       // The file should still exist — we never terminate ourselves
       expect(existsSync(filePath)).toBe(true);
     });
@@ -361,6 +420,14 @@ describe('Port Discovery Module', () => {
       expect(HEARTBEAT_INTERVAL_MS).toBe(30_000);
       expect(HEARTBEAT_STALE_MS).toBe(5 * 60 * 1000);
       expect(MAX_PORT_FILE_AGE_MS).toBe(4 * 60 * 60 * 1000);
+    });
+
+    it('should export reaper/termination constants with safe values', () => {
+      expect(TERMINATE_GRACE_MS).toBeGreaterThan(0);
+      // Orphan age guard must comfortably exceed the bind→advertise window.
+      expect(ORPHAN_MIN_AGE_MS).toBeGreaterThanOrEqual(30_000);
+      // Periodic reaper should run on a much longer cadence than the heartbeat.
+      expect(REAP_INTERVAL_MS).toBeGreaterThan(HEARTBEAT_INTERVAL_MS);
     });
   });
 
@@ -544,5 +611,361 @@ describe('Port Range Fallback Integration', () => {
     }
 
     expect(boundPort).toBe(preferredPort + 2);
+  });
+});
+
+describe('startPeriodicReaper', () => {
+  it('returns an idempotent stop function', () => {
+    const stop = startPeriodicReaper(TEST_PORT_BASE);
+    expect(typeof stop).toBe('function');
+    expect(() => { stop(); stop(); }).not.toThrow();
+  });
+
+  it('starts and stops without leaving a live handle', (done) => {
+    // The interval is unref'd internally; this just confirms the lifecycle is clean.
+    const stop = startPeriodicReaper(TEST_PORT_BASE);
+    setImmediate(() => { stop(); done(); });
+  });
+});
+
+describe('cleanupOrphanedProcesses — SIGKILL escalation (integration)', () => {
+  const runIf = process.platform === 'win32' ? it.skip : it;
+
+  const isAlive = (pid: number): boolean => {
+    try { process.kill(pid, 0); return true; } catch { return false; }
+  };
+  const portListening = (port: number): Promise<boolean> => new Promise((resolve) => {
+    const sock = require('net').connect({ port, host: '127.0.0.1' });
+    sock.once('connect', () => { sock.destroy(); resolve(true); });
+    sock.once('error', () => { resolve(false); });
+  });
+  const waitFor = async (pred: () => boolean | Promise<boolean>, timeoutMs: number): Promise<boolean> => {
+    const end = Date.now() + timeoutMs;
+    while (Date.now() < end) {
+      if (await pred()) return true;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    return false;
+  };
+
+  // Spawn an orphan-shaped helper: binds a port in the range, has no port file,
+  // and (optionally) ignores SIGTERM — the exact zombie shape seen in production.
+  // Filename contains 'local.js' so the cleanup kill-predicate recognises it.
+  const spawnOrphan = async (port: number, ignoreSigterm: boolean) => {
+    const dir = mkdtempSync(join(tmpdir(), 'fcm-orphan-'));
+    const file = join(dir, 'local.js');
+    writeFileSync(
+      file,
+      `const net = require('net');\n` +
+      (ignoreSigterm ? `process.on('SIGTERM', () => {}); // ignore SIGTERM — the bug\n` : '') +
+      `net.createServer().listen(${port}, '127.0.0.1');\n` +
+      `setInterval(() => {}, 1000);\n`,
+    );
+    const child = spawn(process.execPath, [file], { stdio: 'ignore' });
+    const exit: { code: number | null; signal: string | null } = { code: null, signal: null };
+    child.on('exit', (code, signal) => { exit.code = code; exit.signal = signal; });
+    const ok = await waitFor(() => portListening(port), 5000);
+    return { child, dir, exit, listening: ok };
+  };
+
+  runIf('SIGKILL-escalates and reaps an orphan that ignores SIGTERM', async () => {
+    const port = TEST_PORT_BASE + 7; // within getPortRange(TEST_PORT_BASE)
+    const { child, dir, exit, listening } = await spawnOrphan(port, true);
+    try {
+      expect(listening).toBe(true);
+      expect(existsSync(getPortFilePath(port))).toBe(false); // it's an orphan
+      // Sanity: it really does survive a plain SIGTERM.
+      process.kill(child.pid!, 'SIGTERM');
+      await new Promise((r) => setTimeout(r, 300));
+      expect(isAlive(child.pid!)).toBe(true);
+
+      // Reap (age guard off — the child is brand new in this test).
+      cleanupOrphanedProcesses(TEST_PORT_BASE, { minAgeMs: 0 });
+
+      // Escalation must have force-killed it: exit signal is SIGKILL.
+      // (We assert the kill outcome, not the returned count: a test-spawned child
+      // becomes an unreaped zombie momentarily, unlike a real reparented orphan.)
+      expect(await waitFor(() => exit.signal !== null, 3000)).toBe(true);
+      expect(exit.signal).toBe('SIGKILL');
+    } finally {
+      try { child.kill('SIGKILL'); } catch { /* ignore */ }
+      try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+    }
+  }, 20000);
+
+  runIf('spares a brand-new orphan when the age guard is active', async () => {
+    const port = TEST_PORT_BASE + 8;
+    const { child, dir, listening } = await spawnOrphan(port, false);
+    try {
+      expect(listening).toBe(true);
+      // Default guard (ORPHAN_MIN_AGE_MS) protects a process this young — it
+      // could be a sibling mid-startup that hasn't advertised its port yet.
+      cleanupOrphanedProcesses(TEST_PORT_BASE);
+      await new Promise((r) => setTimeout(r, 300));
+      expect(isAlive(child.pid!)).toBe(true);
+    } finally {
+      try { child.kill('SIGKILL'); } catch { /* ignore */ }
+      try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+    }
+  }, 20000);
+
+  runIf('async variant SIGKILL-escalates and reaps an orphan that ignores SIGTERM', async () => {
+    const port = TEST_PORT_BASE + 9; // within getPortRange(TEST_PORT_BASE)
+    const { child, dir, exit, listening } = await spawnOrphan(port, true);
+    try {
+      expect(listening).toBe(true);
+      expect(existsSync(getPortFilePath(port))).toBe(false); // it's an orphan
+
+      await cleanupOrphanedProcessesAsync(TEST_PORT_BASE, { minAgeMs: 0 });
+
+      expect(await waitFor(() => exit.signal !== null, 3000)).toBe(true);
+      expect(exit.signal).toBe('SIGKILL');
+    } finally {
+      try { child.kill('SIGKILL'); } catch { /* ignore */ }
+      try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+    }
+  }, 20000);
+
+  runIf('async variant spares a brand-new orphan when the age guard is active', async () => {
+    const port = TEST_PORT_BASE + 6;
+    const { child, dir, listening } = await spawnOrphan(port, false);
+    try {
+      expect(listening).toBe(true);
+      await cleanupOrphanedProcessesAsync(TEST_PORT_BASE);
+      await new Promise((r) => setTimeout(r, 300));
+      expect(isAlive(child.pid!)).toBe(true);
+    } finally {
+      try { child.kill('SIGKILL'); } catch { /* ignore */ }
+      try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+    }
+  }, 20000);
+});
+
+describe('cleanupStalePortFilesAsync — kill-safety gates (integration)', () => {
+  const runIf = process.platform === 'win32' ? it.skip : it;
+
+  const isAlive = (pid: number): boolean => {
+    try { process.kill(pid, 0); return true; } catch { return false; }
+  };
+  const waitFor = async (pred: () => boolean, timeoutMs: number): Promise<boolean> => {
+    const end = Date.now() + timeoutMs;
+    while (Date.now() < end) {
+      if (pred()) return true;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    return false;
+  };
+
+  // A live sibling-shaped child: real PID, but not this test process.
+  const spawnKeepalive = () => spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+
+  // lastSeen old enough to pass BOTH gates (stale + kill-eligibility margin)
+  const killEligibleLastSeen = () =>
+    new Date(Date.now() - HEARTBEAT_STALE_MS - KILL_ELIGIBLE_EXTRA_STALE_MS - 60_000).toISOString();
+
+  const writeStaleFile = (port: number, pid: number, lastSeen: string) => {
+    writeFileSync(getPortFilePath(port), JSON.stringify({
+      port,
+      pid,
+      host: 'localhost',
+      startedAt: new Date(Date.now() - 10 * 60 * 60 * 1000).toISOString(),
+      lastSeen,
+    }));
+  };
+
+  runIf('does NOT kill a kill-eligible instance whose health probe responds', async () => {
+    const port = TEST_PORT_BASE + 2;
+    const child = spawnKeepalive();
+    const http = require('http');
+    const server = http.createServer((_req: any, res: any) => { res.end('ok'); });
+    await new Promise<void>((resolve) => server.listen(port, '127.0.0.1', resolve));
+    try {
+      writeStaleFile(port, child.pid!, killEligibleLastSeen());
+
+      await cleanupStalePortFilesAsync();
+
+      // Probe succeeded → instance treated as alive: no kill, file retained
+      expect(isAlive(child.pid!)).toBe(true);
+      expect(existsSync(getPortFilePath(port))).toBe(true);
+    } finally {
+      try { child.kill('SIGKILL'); } catch { /* ignore */ }
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      try { unlinkSync(getPortFilePath(port)); } catch { /* ignore */ }
+    }
+  }, 20000);
+
+  runIf('does NOT kill a stale instance still within the kill-eligibility margin', async () => {
+    const port = TEST_PORT_BASE + 3;
+    const child = spawnKeepalive();
+    try {
+      // Stale (past HEARTBEAT_STALE_MS) but NOT yet past the 2-heartbeat
+      // grace — the post-laptop-sleep protection window.
+      writeStaleFile(port, child.pid!, new Date(Date.now() - HEARTBEAT_STALE_MS - 10_000).toISOString());
+
+      await cleanupStalePortFilesAsync();
+
+      expect(isAlive(child.pid!)).toBe(true);
+      expect(existsSync(getPortFilePath(port))).toBe(true);
+    } finally {
+      try { child.kill('SIGKILL'); } catch { /* ignore */ }
+      try { unlinkSync(getPortFilePath(port)); } catch { /* ignore */ }
+    }
+  }, 20000);
+
+  runIf('kills a kill-eligible zombie whose health probe fails', async () => {
+    const port = TEST_PORT_BASE + 4;
+    const child = spawnKeepalive();
+    try {
+      // Nothing listens on the port → curl probe fails → confirmed zombie
+      writeStaleFile(port, child.pid!, killEligibleLastSeen());
+
+      const cleaned = await cleanupStalePortFilesAsync();
+
+      expect(cleaned).toBeGreaterThanOrEqual(1);
+      expect(existsSync(getPortFilePath(port))).toBe(false);
+      expect(await waitFor(() => !isAlive(child.pid!), 3000)).toBe(true);
+    } finally {
+      try { child.kill('SIGKILL'); } catch { /* ignore */ }
+      try { unlinkSync(getPortFilePath(port)); } catch { /* ignore */ }
+    }
+  }, 20000);
+});
+
+// ============================================================================
+// Reaper self-harm regression suite
+//
+// The reaper was terminating healthy MCP servers, producing "Server
+// disconnected" across every MCP client. Three independent defects combined:
+//
+//   1. healthProbeArgs() probed http://127.0.0.1:{port}, but the WebSocket
+//      server binds `localhost`, which Node resolves to the IPv6 loopback on
+//      dual-stack macOS ([::1]). Nothing listens on IPv4, so the probe
+//      returned connection-refused for HEALTHY servers — which the callers
+//      map to `false` = "confirmed dead". Every kill-safety gate built on the
+//      probe was inverted into a rubber stamp.
+//   2. Port files were written with a non-atomic truncate-then-write, and a
+//      reader landing in that window got a parse error that the cleanup paths
+//      treated as "corrupt, delete it".
+//   3. The orphan path killed port-holders with no port file without probing
+//      them at all.
+//
+// Diagnosed 2026-07-29 from a live instance: PID alive, LISTENING on its port,
+// no advertisement file, and `curl 127.0.0.1` failing while `curl localhost`
+// succeeded on the very server handling the session.
+// ============================================================================
+
+describe('Reaper self-harm regressions', () => {
+  describe('health probe addressing', () => {
+    it('probes localhost, not a hardcoded IPv4 literal', () => {
+      // Reads the source rather than the behaviour: the failure mode is that
+      // the probe silently cannot reach an IPv6-bound server, which a unit
+      // test on a machine that happens to bind IPv4 would not catch.
+      const src = readFileSync(
+        join(__dirname, '..', 'src', 'core', 'port-discovery.ts'),
+        'utf-8',
+      );
+      const probeFn = src.slice(
+        src.indexOf('function healthProbeArgs'),
+        src.indexOf('function probeServerHealth'),
+      );
+      expect(probeFn).toContain('http://localhost:');
+      expect(probeFn).not.toContain('http://127.0.0.1:');
+    });
+  });
+
+  describe('atomic port file writes', () => {
+    it('never leaves a partially-written file visible to readers', () => {
+      const port = TEST_PORT_BASE + 21;
+      const filePath = getPortFilePath(port);
+      try {
+        // Rewrite repeatedly while reading — with truncate-then-write this
+        // interleaving is what produced parse failures in siblings.
+        for (let i = 0; i < 60; i++) {
+          advertisePort(port, 'localhost');
+          const raw = readFileSync(filePath, 'utf-8');
+          expect(() => JSON.parse(raw)).not.toThrow();
+          expect(JSON.parse(raw).pid).toBe(process.pid);
+        }
+      } finally {
+        try { unlinkSync(filePath); } catch { /* ignore */ }
+      }
+    });
+
+    it('leaves no .tmp files behind', () => {
+      const port = TEST_PORT_BASE + 22;
+      const filePath = getPortFilePath(port);
+      try {
+        advertisePort(port, 'localhost');
+        expect(existsSync(`${filePath}.${process.pid}.tmp`)).toBe(false);
+      } finally {
+        try { unlinkSync(filePath); } catch { /* ignore */ }
+      }
+    });
+  });
+
+  describe('self-healing heartbeat', () => {
+    it('re-advertises when our own port file is deleted underneath us', () => {
+      const port = TEST_PORT_BASE + 23;
+      const filePath = getPortFilePath(port);
+      try {
+        advertisePort(port, 'localhost');
+        unlinkSync(filePath); // simulate a sibling wrongly deleting it
+        expect(existsSync(filePath)).toBe(false);
+
+        refreshPortAdvertisement(port);
+
+        // Without this, the process stays unadvertised forever and the orphan
+        // reaper eventually terminates it.
+        expect(existsSync(filePath)).toBe(true);
+        expect(readPortFile(port)?.pid).toBe(process.pid);
+      } finally {
+        try { unlinkSync(filePath); } catch { /* ignore */ }
+      }
+    });
+
+    it('does not resurrect a file for a port this process never advertised', () => {
+      const port = TEST_PORT_BASE + 24;
+      const filePath = getPortFilePath(port);
+      try {
+        expect(existsSync(filePath)).toBe(false);
+        refreshPortAdvertisement(port);
+        expect(existsSync(filePath)).toBe(false);
+      } finally {
+        try { unlinkSync(filePath); } catch { /* ignore */ }
+      }
+    });
+
+    it('stops re-advertising after unadvertisePort (clean shutdown)', () => {
+      const port = TEST_PORT_BASE + 25;
+      const filePath = getPortFilePath(port);
+      try {
+        advertisePort(port, 'localhost');
+        unadvertisePort(port);
+        expect(existsSync(filePath)).toBe(false);
+
+        // A heartbeat racing shutdown must not bring the file back.
+        refreshPortAdvertisement(port);
+        expect(existsSync(filePath)).toBe(false);
+      } finally {
+        try { unlinkSync(filePath); } catch { /* ignore */ }
+      }
+    });
+  });
+
+  describe('orphan path health probe', () => {
+    it('probes before terminating a port-holder with no port file', () => {
+      const src = readFileSync(
+        join(__dirname, '..', 'src', 'core', 'port-discovery.ts'),
+        'utf-8',
+      );
+      for (const marker of ['cleanupOrphanedProcesses', 'cleanupOrphanedProcessesAsync']) {
+        const start = src.indexOf(`export ${marker.includes('Async') ? 'async ' : ''}function ${marker}(`);
+        expect(start).toBeGreaterThan(-1);
+        const body = src.slice(start, start + 4000);
+        // The kill must be gated on a definitive probe failure.
+        expect(body).toContain('probeServerHealth');
+        expect(body).toContain("health !== false");
+      }
+    });
   });
 });

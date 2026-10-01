@@ -8,13 +8,13 @@
 export interface IFigmaConnector {
   // Lifecycle
   initialize(): Promise<void>;
-  getTransportType(): 'cdp' | 'websocket';
+  getTransportType(): 'websocket';
 
   // Core execution
   executeInPluginContext<T = any>(code: string): Promise<T>;
   getVariablesFromPluginUI(fileKey?: string): Promise<any>;
   getVariables(fileKey?: string): Promise<any>;
-  executeCodeViaUI(code: string, timeoutMs?: number): Promise<any>;
+  executeCodeViaUI(code: string, timeoutMs?: number, fileKey?: string): Promise<any>;
 
   // Variable operations
   updateVariable(variableId: string, modeId: string, value: any): Promise<any>;
@@ -38,13 +38,43 @@ export interface IFigmaConnector {
   deleteVariableCollection(collectionId: string): Promise<any>;
 
   // Component operations
-  getComponentFromPluginUI(nodeId: string): Promise<any>;
+  /**
+   * Read a component through the plugin. Pass `fileKey` whenever the caller knows
+   * which file it means: node ids are only unique WITHIN a file, so without it
+   * the ACTIVE file answers — possibly with a different component that happens
+   * to share the id. Rejects if that file isn't connected (callers fall back to REST).
+   */
+  getComponentFromPluginUI(nodeId: string, fileKey?: string): Promise<any>;
   getLocalComponents(): Promise<any>;
   setNodeDescription(nodeId: string, description: string, descriptionMarkdown?: string): Promise<any>;
   addComponentProperty(nodeId: string, propertyName: string, type: string, defaultValue: any, options?: any): Promise<any>;
   editComponentProperty(nodeId: string, propertyName: string, newValue: any): Promise<any>;
   deleteComponentProperty(nodeId: string, propertyName: string): Promise<any>;
   instantiateComponent(componentKey: string, options?: any): Promise<any>;
+  createComponentSet(params: {
+    baseComponentId?: string;
+    properties?: Record<string, string[]>;
+    componentIds?: string[];
+    variantProperties?: Array<Record<string, string>>;
+    name?: string;
+    parentId?: string;
+    position?: { x: number; y: number };
+  }): Promise<any>;
+
+  // Slot operations (Figma Slots open beta)
+  createSlot(nodeId: string, options?: { name?: string; width?: number; height?: number; layoutMode?: string }): Promise<any>;
+  getSlots(nodeId: string): Promise<any>;
+  appendToSlot(params: {
+    slotId?: string;
+    instanceId?: string;
+    slotName?: string;
+    sourceNodeId?: string;
+    nodeType?: string;
+    properties?: Record<string, string | number>;
+    clone?: boolean;
+    clearExisting?: boolean;
+  }): Promise<any>;
+  resetSlot(params: { slotId?: string; instanceId?: string; slotName?: string }): Promise<any>;
 
   // Node manipulation
   resizeNode(nodeId: string, width: number, height: number, withConstraints?: boolean): Promise<any>;
@@ -69,11 +99,15 @@ export interface IFigmaConnector {
   // Design lint
   lintDesign(nodeId?: string, rules?: string[], maxDepth?: number, maxFindings?: number): Promise<any>;
 
+  // Component accessibility audit
+  auditComponentAccessibility(nodeId?: string, targetSize?: number): Promise<any>;
+
   // FigJam operations
   createSticky(params: { text: string; color?: string; x?: number; y?: number }): Promise<any>;
   createStickies(params: { stickies: Array<{ text: string; color?: string; x?: number; y?: number }> }): Promise<any>;
-  createConnector(params: { startNodeId: string; endNodeId: string; label?: string }): Promise<any>;
-  createShapeWithText(params: { text?: string; shapeType?: string; x?: number; y?: number }): Promise<any>;
+  createConnector(params: { startNodeId: string; endNodeId: string; label?: string; startMagnet?: string; endMagnet?: string }): Promise<any>;
+  createShapeWithText(params: { text?: string; shapeType?: string; x?: number; y?: number; width?: number; height?: number; fillColor?: string; strokeColor?: string; fontSize?: number; strokeDashPattern?: string }): Promise<any>;
+  createSection(params: { name?: string; x?: number; y?: number; width?: number; height?: number; fillColor?: string }): Promise<any>;
   createTable(params: { rows: number; columns: number; data?: string[][]; x?: number; y?: number }): Promise<any>;
   createCodeBlock(params: { code: string; language?: string; x?: number; y?: number }): Promise<any>;
   getBoardContents(params: { nodeTypes?: string[]; maxNodes?: number }): Promise<any>;
@@ -93,11 +127,13 @@ export interface IFigmaConnector {
   getFocusedSlide(): Promise<any>;
   focusSlide(params: { slideId: string }): Promise<any>;
   skipSlide(params: { slideId: string; skip: boolean }): Promise<any>;
-  addTextToSlide(params: { slideId: string; text: string; x?: number; y?: number; fontSize?: number }): Promise<any>;
+  addTextToSlide(params: { slideId: string; text: string; x?: number; y?: number; fontSize?: number; fontFamily?: string; fontStyle?: string; color?: string; textAlign?: string; width?: number; lineHeight?: number; letterSpacing?: number; textCase?: string }): Promise<any>;
   addShapeToSlide(params: { slideId: string; shapeType: string; x: number; y: number; width: number; height: number; fillColor?: string }): Promise<any>;
+  setSlideBackground(params: { slideId: string; color: string }): Promise<any>;
+  getTextStyles(): Promise<any>;
 
   // Annotation operations
-  getAnnotations(nodeId: string, includeChildren?: boolean, depth?: number): Promise<any>;
+  getAnnotations(nodeId: string, includeChildren?: boolean, depth?: number, fileKey?: string): Promise<any>;
   setAnnotations(nodeId: string, annotations: any[], mode?: 'replace' | 'append'): Promise<any>;
   getAnnotationCategories(): Promise<any>;
 

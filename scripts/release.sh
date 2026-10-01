@@ -8,12 +8,12 @@ set -euo pipefail
 # Run BEFORE manual content edits (banners, changelog entries).
 #
 # Tool counts are auto-detected from the source code unless
-# overridden with --local-tools / --remote-tools / --cloud-tools.
+# overridden with --local-tools / --cloud-tools.
 #
 # Usage:
 #   ./scripts/release.sh --version 1.14.0
 #   ./scripts/release.sh --version 1.14.0 --dry-run
-#   ./scripts/release.sh --version 1.14.0 --local-tools 60 --remote-tools 22 --cloud-tools 44
+#   ./scripts/release.sh --version 1.14.0 --local-tools 121 --cloud-tools 95
 # ─────────────────────────────────────────────────────────
 
 # ── Colors ──────────────────────────────────────────────
@@ -34,7 +34,6 @@ fi
 # ── Argument parsing ────────────────────────────────────
 VERSION=""
 LOCAL_TOOLS=""
-REMOTE_TOOLS=""
 CLOUD_TOOLS=""
 DRY_RUN=false
 GH_RELEASE=""  # "auto" (default), "yes" (--release), "no" (--no-release)
@@ -43,18 +42,16 @@ while [[ $# -gt 0 ]]; do
   case $1 in
     --version)      VERSION="$2";       shift 2 ;;
     --local-tools)  LOCAL_TOOLS="$2";   shift 2 ;;
-    --remote-tools) REMOTE_TOOLS="$2";  shift 2 ;;
     --cloud-tools)  CLOUD_TOOLS="$2";   shift 2 ;;
     --dry-run)      DRY_RUN=true;       shift ;;
     --release)      GH_RELEASE="yes";   shift ;;
     --no-release)   GH_RELEASE="no";    shift ;;
     -h|--help)
-      echo "Usage: ./scripts/release.sh --version X.Y.Z [--local-tools N] [--remote-tools M] [--cloud-tools C] [--dry-run]"
+      echo "Usage: ./scripts/release.sh --version X.Y.Z [--local-tools N] [--cloud-tools C] [--dry-run]"
       echo ""
       echo "Options:"
       echo "  --version       New version number (required, e.g., 1.14.0)"
       echo "  --local-tools   Override local mode tool count (auto-detected from source if omitted)"
-      echo "  --remote-tools  Override remote mode tool count (auto-detected if omitted)"
       echo "  --cloud-tools   Override cloud mode tool count (auto-detected if omitted)"
       echo "  --dry-run       Show what would change without modifying files"
       echo "  --release       Create GitHub Release (auto for minor/major, skip for patch)"
@@ -77,55 +74,50 @@ if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   exit 1
 fi
 
+# ── npm auth precheck (advisory) ────────────────────────
+# Publishing runs in CI via Trusted Publishing / OIDC on a `v*` tag push
+# (.github/workflows/publish.yml) — no local token, no 2FA prompt. A stale
+# or missing ~/.npmrc token therefore does NOT block a release, so this is
+# a warning rather than the hard gate it used to be when the maintainer
+# ran `npm publish` by hand.
+#
+# The token still matters for the manual fallback (`npm publish` from a
+# real TTY), so an expired one is worth flagging — just not worth aborting
+# a release that will never touch it.
+if [[ "$DRY_RUN" == false ]]; then
+  if ! NPM_USER=$(npm whoami 2>/dev/null); then
+    echo -e "${YELLOW}Note: npm auth unavailable${NC} — ${BOLD}npm whoami${NC} returned 401."
+    echo -e "  Not a blocker: publishing runs in CI via OIDC on the ${BOLD}v${VERSION}${NC} tag push."
+    echo -e "  Only refresh the token if you need the manual ${BOLD}npm publish${NC} fallback:"
+    echo -e "  ${CYAN}https://www.npmjs.com/settings/~/tokens${NC}"
+    echo ""
+  else
+    echo -e "${CYAN}npm auth:${NC} ${BOLD}$NPM_USER${NC} (verified)"
+  fi
+fi
+
 # ── Resolve paths ───────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-# ── Auto-detect tool counts from source code ────────────
-auto_count_local() {
-  # All unique figma_* and figjam_* tool names in local mode sources (core + local.ts)
-  grep -roh '"fig\(ma\|jam\)_[a-z_]*"' \
-    "$ROOT/src/core/" "$ROOT/src/local.ts" \
-    2>/dev/null | sort -u | wc -l | tr -d ' '
-}
-
-auto_count_remote() {
-  # Remote/SSE mode: only read-only REST API tools
-  grep -roh '"figma_[a-z_]*"' \
-    "$ROOT/src/core/figma-tools.ts" \
-    2>/dev/null | sort -u | wc -l | tr -d ' '
-}
-
-auto_count_cloud() {
-  # Cloud mode: write-tools + figma-tools + design-system-tools + comment-tools + design-code-tools + figjam-tools + slides-tools + annotation-tools + index.ts cloud-specific
-  grep -roh '"fig\(ma\|jam\)_[a-z_]*"' \
-    "$ROOT/src/core/write-tools.ts" \
-    "$ROOT/src/core/figma-tools.ts" \
-    "$ROOT/src/core/design-system-tools.ts" \
-    "$ROOT/src/core/comment-tools.ts" \
-    "$ROOT/src/core/design-code-tools.ts" \
-    "$ROOT/src/core/figjam-tools.ts" \
-    "$ROOT/src/core/slides-tools.ts" \
-    "$ROOT/src/core/annotation-tools.ts" \
-    "$ROOT/src/index.ts" \
-    2>/dev/null | sort -u | wc -l | tr -d ' '
-}
-
-if [[ -z "$LOCAL_TOOLS" ]]; then
-  LOCAL_TOOLS=$(auto_count_local)
+# ── Tool counts ─────────────────────────────────────────
+# One counter: scripts/update-tool-counts.mjs. Cloud is derived from the /mcp
+# block of src/index.ts. Remote has no count — it is the hosted endpoint before
+# pairing and the docs describe it rather than count it.
+if [[ -z "$LOCAL_TOOLS" || -z "$CLOUD_TOOLS" ]]; then
+  read -r DETECTED_LOCAL DETECTED_CLOUD < <(node "$SCRIPT_DIR/update-tool-counts.mjs" --print-counts)
+  LOCAL_TOOLS="${LOCAL_TOOLS:-$DETECTED_LOCAL}"
+  CLOUD_TOOLS="${CLOUD_TOOLS:-$DETECTED_CLOUD}"
 fi
-if [[ -z "$REMOTE_TOOLS" ]]; then
-  REMOTE_TOOLS=$(auto_count_remote)
-fi
-if [[ -z "$CLOUD_TOOLS" ]]; then
-  CLOUD_TOOLS=$(auto_count_cloud)
+if [[ -z "$LOCAL_TOOLS" || -z "$CLOUD_TOOLS" ]]; then
+  echo "Could not detect tool counts (scripts/update-tool-counts.mjs --print-counts failed)" >&2
+  exit 1
 fi
 
 # ── Preflight ───────────────────────────────────────────
 echo -e "${BOLD}${CYAN}Figma Console MCP — Release Script${NC}"
 echo -e "${CYAN}Version: ${BOLD}$VERSION${NC}"
 echo -e "${CYAN}Local tools:  ${BOLD}$LOCAL_TOOLS${NC} (auto-detected from source)"
-echo -e "${CYAN}Remote tools: ${BOLD}$REMOTE_TOOLS${NC} (auto-detected from source)"
 echo -e "${CYAN}Cloud tools:  ${BOLD}$CLOUD_TOOLS${NC} (auto-detected from source)"
 echo ""
 
@@ -210,108 +202,63 @@ replace_in_file "$ROOT/src/index.ts" \
   "version: \"$VERSION\"" \
   "all McpServer + health version strings"
 
-# ── 4. Local tool count (N+ tools) ─────────────────────
-# Matches any number followed by + and "tool(s)" in context of local/full mode
-# Patterns: "60+ tools", "the full 60+", "All 59+ tools", "**59+**"
-echo -e "${BOLD}4. Local tool count → ${LOCAL_TOOLS}+${NC}"
+# ── 3c. MCP_VERSION sync in src/core/tokens-tools.ts ───
+# The token sync tools stamp this version into DTCG $extensions.mcpVersion
+# on every export so token files record which MCP build produced them.
+echo -e "${BOLD}3c. src/core/tokens-tools.ts MCP_VERSION${NC}"
+replace_in_file "$ROOT/src/core/tokens-tools.ts" \
+  "const MCP_VERSION = \"[0-9]+\.[0-9]+\.[0-9]+\"" \
+  "const MCP_VERSION = \"$VERSION\"" \
+  "MCP_VERSION constant"
 
-for f in "${ALL_DOC_FILES[@]}"; do
-  # "N+ tools" — the most common pattern (e.g., "60+ tools", "59+ tools")
-  replace_in_file "$ROOT/$f" \
-    "[0-9]+\+ tools" \
-    "${LOCAL_TOOLS}+ tools" \
-    "N+ tools"
-
-  # "full N+" — e.g., "the full 60+" at end of sentence
-  replace_in_file "$ROOT/$f" \
-    "full [0-9]+\+" \
-    "full ${LOCAL_TOOLS}+" \
-    "full N+"
-
-  # "**N+**" — bold markdown pattern in tables
-  replace_in_file "$ROOT/$f" \
-    "\*\*[0-9]+\+\*\*" \
-    "**${LOCAL_TOOLS}+**" \
-    "**N+** bold"
-
-  # "All N+" — e.g., "All 59+ tools"
-  replace_in_file "$ROOT/$f" \
-    "All [0-9]+\+" \
-    "All ${LOCAL_TOOLS}+" \
-    "All N+"
-
-  # "N+ tool " (singular with trailing space, e.g., "57+ tool access")
-  replace_in_file "$ROOT/$f" \
-    "[0-9]+\+ tool " \
-    "${LOCAL_TOOLS}+ tool " \
-    "N+ tool (singular)"
-
-  # '<span class="number">N+</span>' — landing page HTML in src/index.ts
-  replace_in_file "$ROOT/$f" \
-    '"number">[0-9]+\+<' \
-    "\"number\">${LOCAL_TOOLS}+<" \
-    'HTML <span class="number">N+</span>'
-done
-
-# ── 5. Remote tool count (read-only SSE mode) ──────────
-echo -e "${BOLD}5. Remote tool count → ${REMOTE_TOOLS}${NC}"
-
-for f in "${ALL_DOC_FILES[@]}"; do
-  # "N read-only tools"
-  replace_in_file "$ROOT/$f" \
-    "[0-9]+ read-only tools" \
-    "${REMOTE_TOOLS} read-only tools" \
-    "N read-only tools"
-
-  # "Only N tools"
-  replace_in_file "$ROOT/$f" \
-    "Only [0-9]+ tools" \
-    "Only ${REMOTE_TOOLS} tools" \
-    "Only N tools"
-
-  # ", N in Remote"
-  replace_in_file "$ROOT/$f" \
-    ", [0-9]+ in Remote" \
-    ", ${REMOTE_TOOLS} in Remote" \
-    "N in Remote"
-
-  # "(N tools)" in remote context — be careful not to match cloud tools
-  # Only match in files that discuss remote mode specifically
-  if [[ "$f" == "docs/mode-comparison.md" || "$f" == "docs/setup.md" || "$f" == "docs/introduction.md" ]]; then
-    # "22 tools" on lines mentioning "read-only" or "remote" or "SSE"
-    :
+# ── 3b. PLUGIN_VERSION sync in figma-desktop-bridge/code.js ──
+# Bumped ONLY when plugin files actually changed since the last release.
+# When they did change, the bump busts Figma's plugin-file cache and marks
+# older imported plugins stale (issue #62). When they did NOT change
+# (server-only release: deps, docs, server code), the constant must stay
+# put — the server's FILE_INFO handshake compares the plugin's reported
+# version against THIS constant, and bumping it would falsely flag every
+# connected plugin as needing a re-import.
+echo -e "${BOLD}3b. figma-desktop-bridge PLUGIN_VERSION${NC}"
+PLUGIN_FILES_CHANGED=true
+if git -C "$ROOT" rev-parse -q --verify "v$CURRENT_VERSION" > /dev/null 2>&1; then
+  # -I ignores the PLUGIN_VERSION line itself (a prior bump must not read as a
+  # "plugin change" next release) and JS comment lines (comment-only edits
+  # don't require a re-import).
+  if git -C "$ROOT" diff --quiet -I '^var PLUGIN_VERSION' -I '^//' "v$CURRENT_VERSION" -- figma-desktop-bridge/; then
+    PLUGIN_FILES_CHANGED=false
   fi
-done
+fi
+if $PLUGIN_FILES_CHANGED; then
+  replace_in_file "$ROOT/figma-desktop-bridge/code.js" \
+    "var PLUGIN_VERSION = '[0-9]+\.[0-9]+\.[0-9]+'" \
+    "var PLUGIN_VERSION = '$VERSION'" \
+    "PLUGIN_VERSION constant"
+else
+  echo -e "  ${CYAN}SKIP${NC} figma-desktop-bridge/code.js — no plugin file changes since v$CURRENT_VERSION (server-only release; keeping PLUGIN_VERSION so connected plugins aren't falsely flagged stale)"
+fi
 
-# ── 6. Cloud tool count ────────────────────────────────
-echo -e "${BOLD}6. Cloud tool count → ${CLOUD_TOOLS}${NC}"
-
-for f in "${ALL_DOC_FILES[@]}"; do
-  # "(N tools)" — cloud mode parenthesized pattern, e.g., "(44 tools)"
-  # This is the primary cloud mode pattern used in mode-comparison.md
-  replace_in_file "$ROOT/$f" \
-    "\\(([0-9]+) tools\\)" \
-    "(${CLOUD_TOOLS} tools)" \
-    "(N tools) cloud"
-
-  # "N tools including full write" — cloud mode in README
-  replace_in_file "$ROOT/$f" \
-    "[0-9]+ tools including full write" \
-    "${CLOUD_TOOLS} tools including full write" \
-    "N tools including full write"
-
-  # "get N tools"
-  replace_in_file "$ROOT/$f" \
-    "get [0-9]+ tools" \
-    "get ${CLOUD_TOOLS} tools" \
-    "get N tools"
-
-  # "— N tools" in cloud context
-  replace_in_file "$ROOT/$f" \
-    "— [0-9]+ tools" \
-    "— ${CLOUD_TOOLS} tools" \
-    "— N tools"
-done
+# ── 4. Tool counts (Local / Cloud) ────────────
+# Delegated to scripts/update-tool-counts.mjs — a manifest that knows the MODE
+# of every count reference explicitly ({file, pattern, mode} entries). This
+# replaced the old sed approach, which shipped wrong-mode counts in three
+# consecutive releases (v1.33.0, v1.33.1, v1.34.0). The script self-audits
+# after applying (Phase 3.5 Block D) and exits nonzero on any wrong-mode
+# count or unclassified "N tools" reference.
+echo -e "${BOLD}4. Tool counts (local/cloud) — update-tool-counts.mjs${NC}"
+COUNT_ARGS=(--local "$LOCAL_TOOLS" --cloud "$CLOUD_TOOLS")
+if $DRY_RUN; then
+  COUNT_ARGS+=(--dry-run)
+fi
+if node "$SCRIPT_DIR/update-tool-counts.mjs" "${COUNT_ARGS[@]}"; then
+  CHANGES+=("tool counts: manifest-driven update (update-tool-counts.mjs)")
+else
+  echo -e "${RED}Tool-count update/verify FAILED.${NC}"
+  echo -e "  A count is inconsistent or a new/changed doc sentence with a tool count"
+  echo -e "  isn't classified. Fix the docs, or update MANIFEST/ALLOWLIST in"
+  echo -e "  ${CYAN}scripts/update-tool-counts.mjs${NC}, then re-run."
+  exit 1
+fi
 
 # ── 7. Lockfile sync ───────────────────────────────────
 echo -e "${BOLD}7. Lockfile sync${NC}"
@@ -366,6 +313,27 @@ ${COMPARISON_LINK}" "$CHANGELOG"
   CHANGES+=("CHANGELOG.md: version scaffold")
 fi
 
+# ── 8b. Front-page banners: link + version stamp ──────
+# The banner WORDING is editorial (what shipped), so it stays a manual step —
+# but the mechanical parts are automated, and a banner that doesn't mention the
+# release being cut is flagged loudly instead of silently going stale (it
+# pointed at the v1.40.0 notes through seven patch releases before this existed).
+echo -e "${BOLD}8b. Front-page banners${NC}"
+BANNER_ANCHOR="${VERSION//./}---${TODAY}"   # GitHub anchor for "## [x.y.z] - date"
+for banner_file in "$ROOT/README.md" "$ROOT/docs/index.mdx"; do
+  replace_in_file "$banner_file" 'CHANGELOG\.md#[0-9]+---[0-9]{4}-[0-9]{2}-[0-9]{2}' "CHANGELOG.md#${BANNER_ANCHOR}" "banner \"See what's new\" → v$VERSION notes"
+  # (two calls: replace_in_file uses "|" as its sed delimiter, so no alternation)
+  replace_in_file "$banner_file" 'latest v[0-9]+\.[0-9]+\.[0-9]+' "latest v${VERSION}" "banner \"latest\" stamp → v$VERSION"
+  replace_in_file "$banner_file" 'patched v[0-9]+\.[0-9]+\.[0-9]+' "patched v${VERSION}" "banner \"patched\" stamp → v$VERSION"
+done
+# The stamp above updates automatically, so "does it mention the version" can't
+# tell whether the WORDING is current — show the exact headline every release.
+readme_banner=$(grep -m1 -E '^> \*\*🆕' "$ROOT/README.md" | cut -c1-120)
+docs_banner=$(awk '/^<Note>/{getline; print; exit}' "$ROOT/docs/index.mdx" | cut -c1-120)
+echo -e "  ${YELLOW}CHECK${NC} Banner wording is manual — confirm it still describes v$VERSION:"
+echo -e "       README.md:      ${readme_banner:-(no 🆕 banner found)}…"
+echo -e "       docs/index.mdx: ${docs_banner:-(no <Note> banner found)}…"
+
 # ── Step 9: GitHub Release (optional) ──────────────────
 # Auto-creates for minor/major bumps (x.Y.0 or X.0.0), skips for patches.
 # Override with --release or --no-release.
@@ -386,8 +354,26 @@ if $CREATE_RELEASE; then
   if $DRY_RUN; then
     echo -e "  ${CYAN}WOULD${NC} create GitHub Release v${VERSION} (--latest)"
   else
-    if command -v gh &>/dev/null; then
-      # Pull release notes from CHANGELOG.md — extract content between this version header and the next
+    if ! command -v gh &>/dev/null; then
+      echo -e "  ${YELLOW}SKIP${NC} GitHub Release — gh CLI not installed"
+    elif ! git rev-parse "v${VERSION}" &>/dev/null; then
+      # This script runs at Phase 2 — BEFORE the version bump is committed and
+      # tagged (Phase 5). `gh release create` on a tag that doesn't exist yet
+      # makes one from the REMOTE default branch head, which is the commit
+      # *without* the version bump. That tag push then fires
+      # .github/workflows/publish.yml against a tree whose package.json still
+      # holds the previous version. It also captures the CHANGELOG section
+      # while it's still an empty Phase 3 scaffold.
+      #
+      # So: never create it here. Print the command to run after the tag is
+      # pushed, when the notes are written and the tag points at the release.
+      echo -e "  ${YELLOW}DEFER${NC} GitHub Release — tag v${VERSION} doesn't exist yet"
+      echo -e "         Creating it now would tag the wrong commit and trigger publish early."
+      echo -e "         After committing, tagging, and pushing, run:"
+      echo -e "         ${CYAN}gh release create v${VERSION} -t v${VERSION} --latest --notes-from-tag${NC}"
+      echo -e "         (or pass -F with the finished CHANGELOG section)"
+    else
+      # Tag exists locally — safe to publish notes from the finished CHANGELOG.
       RELEASE_NOTES=$(awk "/^## \\[${VERSION}\\]/{found=1; next} /^## \\[/{if(found) exit} found" "$ROOT/CHANGELOG.md" | sed '/^$/d')
       if [[ -z "$RELEASE_NOTES" ]]; then
         RELEASE_NOTES="See [CHANGELOG](https://github.com/southleft/figma-console-mcp/blob/main/CHANGELOG.md) for details."
@@ -402,8 +388,6 @@ if $CREATE_RELEASE; then
         -n "$RELEASE_NOTES" 2>/dev/null && \
         echo -e "  ${GREEN}DONE${NC} GitHub Release v${VERSION} created" || \
         echo -e "  ${YELLOW}SKIP${NC} GitHub Release — already exists or gh not authenticated"
-    else
-      echo -e "  ${YELLOW}SKIP${NC} GitHub Release — gh CLI not installed"
     fi
   fi
   CHANGES+=("GitHub Release: v${VERSION}")
@@ -424,8 +408,7 @@ echo ""
 
 echo -e "${CYAN}Tool counts applied:${NC}"
 echo -e "  Local:  ${BOLD}${LOCAL_TOOLS}+${NC} tools (NPX/Local Git)"
-echo -e "  Cloud:  ${BOLD}${CLOUD_TOOLS}${NC} tools (Cloud Write Relay)"
-echo -e "  Remote: ${BOLD}${REMOTE_TOOLS}${NC} tools (SSE read-only)"
+echo -e "  Cloud:  ${BOLD}${CLOUD_TOOLS}${NC} tools (/mcp endpoint after pairing)"
 echo ""
 
 # ── Remaining manual steps ──────────────────────────────

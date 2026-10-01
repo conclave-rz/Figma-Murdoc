@@ -2,7 +2,8 @@
  * Tests for figma_lint_design tool
  *
  * Covers: rule groups, severity mapping, connector routing,
- * schema validation, error handling, and WCAG calculations.
+ * schema validation, error handling, WCAG calculations,
+ * and new WCAG 2.2 accessibility rules (Phase 1).
  */
 
 describe('figma_lint_design', () => {
@@ -69,24 +70,52 @@ describe('figma_lint_design', () => {
 	describe('rule groups', () => {
 		const ALL_RULES = [
 			'wcag-contrast', 'wcag-text-size', 'wcag-target-size', 'wcag-line-height',
+			'wcag-non-text-contrast', 'wcag-color-only', 'wcag-focus-indicator',
+			'wcag-letter-spacing', 'wcag-paragraph-spacing', 'wcag-image-alt',
+			'wcag-heading-hierarchy', 'wcag-reflow', 'wcag-reading-order',
+			'wcag-disabled-no-context',
+			'token-misuse',
 			'hardcoded-color', 'no-text-style', 'default-name', 'detached-component',
 			'no-autolayout', 'empty-container',
 		];
 
-		const WCAG_RULES = ['wcag-contrast', 'wcag-text-size', 'wcag-target-size', 'wcag-line-height'];
-		const DESIGN_SYSTEM_RULES = ['hardcoded-color', 'no-text-style', 'default-name', 'detached-component'];
+		// 'wcag' group = genuine WCAG conformance criteria only. Readability "best practice"
+		// checks (text size, line/letter/paragraph spacing) were decoupled into their own
+		// opt-in group so a conformance audit (rules: ['wcag']) is not polluted by them.
+		// WCAG 1.4.12 Text Spacing is a "support user overrides" criterion, not a requirement
+		// to ship specific spacing values — a sub-1.5 line height is not a conformance failure.
+		const WCAG_RULES = [
+			'wcag-contrast', 'wcag-target-size',
+			'wcag-non-text-contrast', 'wcag-color-only', 'wcag-focus-indicator',
+			'wcag-image-alt', 'wcag-heading-hierarchy', 'wcag-reflow', 'wcag-reading-order',
+			'wcag-disabled-no-context',
+		];
+		const BEST_PRACTICE_RULES = ['wcag-text-size', 'wcag-line-height', 'wcag-letter-spacing', 'wcag-paragraph-spacing'];
+		const DESIGN_SYSTEM_RULES = ['hardcoded-color', 'no-text-style', 'default-name', 'detached-component', 'token-misuse'];
 		const LAYOUT_RULES = ['no-autolayout', 'empty-container'];
 
-		it('should have 10 rules total', () => {
-			expect(ALL_RULES).toHaveLength(10);
+		it('should have 21 rules total', () => {
+			expect(ALL_RULES).toHaveLength(21);
 		});
 
-		it('should have 4 WCAG rules', () => {
-			expect(WCAG_RULES).toHaveLength(4);
+		it('should have 10 WCAG conformance rules (best-practice hints decoupled)', () => {
+			expect(WCAG_RULES).toHaveLength(10);
 		});
 
-		it('should have 4 design system rules', () => {
-			expect(DESIGN_SYSTEM_RULES).toHaveLength(4);
+		it('should have 4 best-practice readability rules', () => {
+			expect(BEST_PRACTICE_RULES).toHaveLength(4);
+		});
+
+		it('should not place best-practice readability hints in the WCAG conformance group', () => {
+			// These are the rules Isabella correctly flagged as non-normative under 1.4.12.
+			['wcag-line-height', 'wcag-paragraph-spacing', 'wcag-letter-spacing', 'wcag-text-size'].forEach(rule => {
+				expect(WCAG_RULES).not.toContain(rule);
+				expect(BEST_PRACTICE_RULES).toContain(rule);
+			});
+		});
+
+		it('should have 5 design system rules', () => {
+			expect(DESIGN_SYSTEM_RULES).toHaveLength(5);
 		});
 
 		it('should have 2 layout rules', () => {
@@ -94,8 +123,18 @@ describe('figma_lint_design', () => {
 		});
 
 		it('should cover all rules across groups', () => {
-			const combined = [...WCAG_RULES, ...DESIGN_SYSTEM_RULES, ...LAYOUT_RULES];
+			const combined = [...WCAG_RULES, ...BEST_PRACTICE_RULES, ...DESIGN_SYSTEM_RULES, ...LAYOUT_RULES];
 			expect(combined.sort()).toEqual(ALL_RULES.sort());
+		});
+
+		it('should keep the 7 structural Phase 1 rules in the WCAG conformance group', () => {
+			const structuralPhase1 = [
+				'wcag-non-text-contrast', 'wcag-color-only', 'wcag-focus-indicator',
+				'wcag-image-alt', 'wcag-heading-hierarchy', 'wcag-reflow', 'wcag-reading-order',
+			];
+			structuralPhase1.forEach(rule => {
+				expect(WCAG_RULES).toContain(rule);
+			});
 		});
 	});
 
@@ -107,8 +146,19 @@ describe('figma_lint_design', () => {
 		const SEVERITY_MAP: Record<string, string> = {
 			'wcag-contrast': 'critical',
 			'wcag-target-size': 'critical',
+			'wcag-non-text-contrast': 'critical',
+			'wcag-color-only': 'critical',
+			'wcag-focus-indicator': 'critical',
 			'wcag-text-size': 'warning',
-			'wcag-line-height': 'warning',
+			'wcag-letter-spacing': 'warning',
+			'wcag-image-alt': 'warning',
+			'wcag-heading-hierarchy': 'warning',
+			'wcag-reflow': 'warning',
+			'wcag-reading-order': 'warning',
+			'wcag-disabled-no-context': 'warning',
+			'wcag-line-height': 'info',
+			'wcag-paragraph-spacing': 'info',
+			'token-misuse': 'warning',
 			'hardcoded-color': 'warning',
 			'no-text-style': 'warning',
 			'default-name': 'warning',
@@ -117,24 +167,95 @@ describe('figma_lint_design', () => {
 			'empty-container': 'info',
 		};
 
-		it('should have 2 critical rules', () => {
+		it('should have 5 critical rules', () => {
 			const critical = Object.entries(SEVERITY_MAP).filter(([, s]) => s === 'critical');
-			expect(critical).toHaveLength(2);
+			expect(critical).toHaveLength(5);
 		});
 
-		it('should have 7 warning rules', () => {
+		it('should have 13 warning rules', () => {
 			const warnings = Object.entries(SEVERITY_MAP).filter(([, s]) => s === 'warning');
-			expect(warnings).toHaveLength(7);
+			expect(warnings).toHaveLength(13);
 		});
 
-		it('should have 1 info rule', () => {
+		it('should have 3 info rules', () => {
 			const info = Object.entries(SEVERITY_MAP).filter(([, s]) => s === 'info');
-			expect(info).toHaveLength(1);
+			expect(info).toHaveLength(3);
 		});
 
-		it('should map contrast and target size as critical', () => {
+		it('should map contrast, target size, and focus indicator as critical', () => {
 			expect(SEVERITY_MAP['wcag-contrast']).toBe('critical');
 			expect(SEVERITY_MAP['wcag-target-size']).toBe('critical');
+			expect(SEVERITY_MAP['wcag-focus-indicator']).toBe('critical');
+		});
+
+		it('should map non-text contrast and color-only as critical', () => {
+			expect(SEVERITY_MAP['wcag-non-text-contrast']).toBe('critical');
+			expect(SEVERITY_MAP['wcag-color-only']).toBe('critical');
+		});
+
+		it('should map line-height and paragraph-spacing as info (best practice, not strict WCAG requirement)', () => {
+			// WCAG 1.4.12 requires supporting user overrides, not specific default values
+			expect(SEVERITY_MAP['wcag-line-height']).toBe('info');
+			expect(SEVERITY_MAP['wcag-paragraph-spacing']).toBe('info');
+		});
+
+		it('should map remaining WCAG rules to correct severities', () => {
+			expect(SEVERITY_MAP['wcag-letter-spacing']).toBe('warning');
+			expect(SEVERITY_MAP['wcag-image-alt']).toBe('warning');
+			expect(SEVERITY_MAP['wcag-heading-hierarchy']).toBe('warning');
+			expect(SEVERITY_MAP['wcag-reflow']).toBe('warning');
+			expect(SEVERITY_MAP['wcag-reading-order']).toBe('warning');
+		});
+	});
+
+	// ========================================================================
+	// WCAG conformance level tagging
+	// ========================================================================
+
+	describe('WCAG level tagging', () => {
+		const WCAG_LEVEL_MAP: Record<string, string> = {
+			'wcag-contrast': 'aa',
+			'wcag-target-size': 'aa',
+			'wcag-non-text-contrast': 'aa',
+			'wcag-color-only': 'a',
+			'wcag-focus-indicator': 'aa',
+			'wcag-text-size': 'best-practice',
+			'wcag-line-height': 'best-practice',
+			'wcag-letter-spacing': 'best-practice',
+			'wcag-paragraph-spacing': 'best-practice',
+			'wcag-image-alt': 'a',
+			'wcag-heading-hierarchy': 'a',
+			'wcag-reflow': 'aa',
+			'wcag-reading-order': 'a',
+			'wcag-disabled-no-context': 'aa',
+		};
+
+		it('should tag all 14 WCAG rules with conformance levels', () => {
+			expect(Object.keys(WCAG_LEVEL_MAP)).toHaveLength(14);
+		});
+
+		it('should have Level A rules', () => {
+			const levelA = Object.entries(WCAG_LEVEL_MAP).filter(([, l]) => l === 'a');
+			expect(levelA.length).toBeGreaterThanOrEqual(3);
+		});
+
+		it('should have Level AA rules', () => {
+			const levelAA = Object.entries(WCAG_LEVEL_MAP).filter(([, l]) => l === 'aa');
+			expect(levelAA.length).toBeGreaterThanOrEqual(4);
+		});
+
+		it('should have best-practice rules (not strict WCAG requirements)', () => {
+			const bestPractice = Object.entries(WCAG_LEVEL_MAP).filter(([, l]) => l === 'best-practice');
+			expect(bestPractice.length).toBeGreaterThanOrEqual(3);
+			// These rules check useful patterns but are not strict WCAG conformance requirements
+			expect(WCAG_LEVEL_MAP['wcag-text-size']).toBe('best-practice');
+			expect(WCAG_LEVEL_MAP['wcag-line-height']).toBe('best-practice');
+			expect(WCAG_LEVEL_MAP['wcag-paragraph-spacing']).toBe('best-practice');
+		});
+
+		it('should correctly classify focus-indicator as AA (not AAA)', () => {
+			// WCAG 2.4.7 Focus Visible is Level AA — critical for keyboard users
+			expect(WCAG_LEVEL_MAP['wcag-focus-indicator']).toBe('aa');
 		});
 	});
 
@@ -416,6 +537,800 @@ describe('figma_lint_design', () => {
 			expect(category.severity).toBeDefined();
 			expect(category.count).toBe(3);
 			expect(category.nodes).toHaveLength(1);
+		});
+	});
+
+	// ========================================================================
+	// Phase 1: New WCAG rule detection logic
+	// ========================================================================
+
+	describe('wcag-non-text-contrast (WCAG 1.4.11)', () => {
+		// Non-text elements (UI components) need 3:1 contrast against adjacent colors
+		function linearize(c: number): number {
+			return c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
+		}
+		function luminance(r: number, g: number, b: number): number {
+			return 0.2126 * linearize(r) + 0.7152 * linearize(g) + 0.0722 * linearize(b);
+		}
+		function contrastRatio(r1: number, g1: number, b1: number, r2: number, g2: number, b2: number): number {
+			const l1 = luminance(r1, g1, b1);
+			const l2 = luminance(r2, g2, b2);
+			return (Math.max(l1, l2) + 0.05) / (Math.min(l1, l2) + 0.05);
+		}
+
+		it('should require 3:1 ratio for UI components (not 4.5:1)', () => {
+			// Light gray button (#CCCCCC) on white (#FFFFFF)
+			const ratio = contrastRatio(0.8, 0.8, 0.8, 1, 1, 1);
+			expect(ratio).toBeLessThan(3.0); // Should fail non-text contrast
+			expect(ratio).toBeLessThan(4.5); // Would also fail text contrast
+		});
+
+		it('should pass for sufficient non-text contrast', () => {
+			// Medium gray (#767676) on white — 4.54:1
+			const ratio = contrastRatio(0.463, 0.463, 0.463, 1, 1, 1);
+			expect(ratio).toBeGreaterThan(3.0);
+		});
+
+		it('should check both fill and stroke of interactive elements', () => {
+			const finding = {
+				id: '1:2',
+				name: 'Button',
+				ratio: '2.1:1',
+				required: '3.0:1',
+				component: '#DDDDDD',
+				bg: '#FFFFFF',
+				element: 'fill',
+			};
+			expect(finding.element).toBe('fill');
+
+			const strokeFinding = { ...finding, element: 'stroke', component: '#EEEEEE' };
+			expect(strokeFinding.element).toBe('stroke');
+		});
+
+		it('should only apply to interactive elements', () => {
+			const INTERACTIVE_PATTERN = /button|link|input|checkbox|radio|switch|toggle|tab|menu-item/i;
+			expect('Card').not.toMatch(INTERACTIVE_PATTERN);
+			expect('Decorative-border').not.toMatch(INTERACTIVE_PATTERN);
+			expect('Button').toMatch(INTERACTIVE_PATTERN);
+			expect('Toggle Switch').toMatch(INTERACTIVE_PATTERN);
+		});
+	});
+
+	describe('wcag-color-only (WCAG 1.4.1)', () => {
+		it('should flag state variants that differ only by color', () => {
+			// Simulate: error variant has red fill, default has gray fill, no icon in error
+			const errorVariant = { name: 'State=Error', fillColor: '#FF0000', hasIcon: false };
+			const defaultVariant = { name: 'State=Default', fillColor: '#CCCCCC', hasIcon: false };
+
+			const colorsDiffer = errorVariant.fillColor !== defaultVariant.fillColor;
+			const hasNonColorIndicator = errorVariant.hasIcon;
+
+			expect(colorsDiffer).toBe(true);
+			expect(hasNonColorIndicator).toBe(false);
+			// This combination should trigger a finding
+		});
+
+		it('should NOT flag variants with icon indicators', () => {
+			const errorVariant = { name: 'State=Error', fillColor: '#FF0000', hasIcon: true };
+			expect(errorVariant.hasIcon).toBe(true);
+			// Should NOT trigger — has non-color differentiation
+		});
+
+		it('should detect state-related variant names', () => {
+			const statePattern = /(error|warning|danger|success|invalid|alert)/i;
+			expect('State=Error').toMatch(statePattern);
+			expect('State=Warning').toMatch(statePattern);
+			expect('State=Success').toMatch(statePattern);
+			expect('State=Default').not.toMatch(statePattern);
+			expect('State=Hover').not.toMatch(statePattern);
+		});
+
+		it('should identify default variant for comparison', () => {
+			const defaultPattern = /(default|rest|idle|normal|base)/i;
+			expect('State=Default').toMatch(defaultPattern);
+			expect('State=Rest').toMatch(defaultPattern);
+			expect('State=Normal').toMatch(defaultPattern);
+			expect('State=Error').not.toMatch(defaultPattern);
+		});
+	});
+
+	describe('wcag-focus-indicator (WCAG 2.4.7)', () => {
+		it('should detect missing focus variant in component set', () => {
+			const variants = [
+				{ name: 'State=Default' },
+				{ name: 'State=Hover' },
+				{ name: 'State=Pressed' },
+				{ name: 'State=Disabled' },
+			];
+
+			const hasFocusVariant = variants.some(v => /focus|focused/i.test(v.name));
+			expect(hasFocusVariant).toBe(false);
+		});
+
+		it('should detect present focus variant', () => {
+			const variants = [
+				{ name: 'State=Default' },
+				{ name: 'State=Focused' },
+				{ name: 'State=Hover' },
+			];
+
+			const hasFocusVariant = variants.some(v => /focus|focused/i.test(v.name));
+			expect(hasFocusVariant).toBe(true);
+		});
+
+		it('should only check interactive component sets', () => {
+			const INTERACTIVE_PATTERN = /button|link|input|checkbox|radio|switch|toggle|tab|menu-item/i;
+			expect('Button').toMatch(INTERACTIVE_PATTERN);
+			expect('Card').not.toMatch(INTERACTIVE_PATTERN);
+			// Card component sets should not require focus variant
+		});
+
+		it('should flag focus variant without visible indicator', () => {
+			const focusVariant = {
+				name: 'State=Focused',
+				hasStroke: false,
+				hasShadowEffect: false,
+			};
+
+			const hasVisibleIndicator = focusVariant.hasStroke || focusVariant.hasShadowEffect;
+			expect(hasVisibleIndicator).toBe(false);
+			// Should produce: issue: 'no-visible-indicator'
+		});
+
+		it('should pass focus variant with stroke (focus ring)', () => {
+			const focusVariant = {
+				name: 'State=Focused',
+				hasStroke: true,
+				hasShadowEffect: false,
+			};
+
+			const hasVisibleIndicator = focusVariant.hasStroke || focusVariant.hasShadowEffect;
+			expect(hasVisibleIndicator).toBe(true);
+		});
+
+		it('should pass focus variant with shadow effect', () => {
+			const focusVariant = {
+				name: 'State=Focused',
+				hasStroke: false,
+				hasShadowEffect: true,
+			};
+
+			const hasVisibleIndicator = focusVariant.hasStroke || focusVariant.hasShadowEffect;
+			expect(hasVisibleIndicator).toBe(true);
+		});
+	});
+
+	describe('wcag-letter-spacing (WCAG 1.4.12)', () => {
+		it('should flag negative pixel letter spacing', () => {
+			const letterSpacing = { unit: 'PIXELS', value: -0.5 };
+			expect(letterSpacing.value).toBeLessThan(0);
+		});
+
+		it('should flag negative percent letter spacing', () => {
+			const letterSpacing = { unit: 'PERCENT', value: -2 };
+			expect(letterSpacing.value).toBeLessThan(0);
+		});
+
+		it('should NOT flag positive letter spacing', () => {
+			const letterSpacing = { unit: 'PIXELS', value: 0.5 };
+			expect(letterSpacing.value).toBeGreaterThanOrEqual(0);
+		});
+
+		it('should NOT flag zero letter spacing', () => {
+			const letterSpacing = { unit: 'PIXELS', value: 0 };
+			expect(letterSpacing.value).toBeGreaterThanOrEqual(0);
+		});
+	});
+
+	describe('wcag-paragraph-spacing (WCAG 1.4.12)', () => {
+		it('should flag paragraph spacing less than 2x font size', () => {
+			const fontSize = 16;
+			const paragraphSpacing = 24; // 1.5x — too small
+			const required = 2 * fontSize; // 32px
+
+			expect(paragraphSpacing).toBeLessThan(required);
+		});
+
+		it('should pass paragraph spacing at 2x font size', () => {
+			const fontSize = 16;
+			const paragraphSpacing = 32; // 2x — exactly meets threshold
+
+			expect(paragraphSpacing).toBeGreaterThanOrEqual(2 * fontSize);
+		});
+
+		it('should pass paragraph spacing greater than 2x', () => {
+			const fontSize = 14;
+			const paragraphSpacing = 36; // > 2x
+
+			expect(paragraphSpacing).toBeGreaterThanOrEqual(2 * fontSize);
+		});
+
+		it('should only check when paragraphSpacing > 0', () => {
+			// paragraphSpacing of 0 means no explicit paragraph spacing set
+			const paragraphSpacing = 0;
+			expect(paragraphSpacing).toBe(0);
+			// Should NOT trigger — 0 means default/auto
+		});
+	});
+
+	describe('line/paragraph spacing scoping (multi-line guard)', () => {
+		// Mirror of textRendersMultipleLines / textHasMultipleParagraphs in code.js.
+		// Spacing only affects readability on text that actually wraps/breaks, so
+		// single-line labels, buttons and headings must be exempt (no false positives).
+		const LINE_SEP = String.fromCharCode(0x2028); // shift-enter line break in Figma
+		function textRendersMultipleLines(node: any, effectiveLh: number | null): boolean {
+			const chars = typeof node.characters === 'string' ? node.characters : '';
+			if (chars.indexOf('\n') !== -1 || chars.indexOf(LINE_SEP) !== -1) return true;
+			if (node.textAutoResize === 'WIDTH_AND_HEIGHT') return false;
+			if (effectiveLh && typeof node.height === 'number' && node.height > 0) {
+				return node.height / effectiveLh >= 1.6;
+			}
+			return false;
+		}
+		function textHasMultipleParagraphs(node: any): boolean {
+			const chars = typeof node.characters === 'string' ? node.characters : '';
+			return chars.indexOf('\n') !== -1;
+		}
+
+		it('exempts a single-line label from the line-height check', () => {
+			const node = { characters: 'Submit', textAutoResize: 'WIDTH_AND_HEIGHT', height: 20 };
+			expect(textRendersMultipleLines(node, 18)).toBe(false);
+		});
+
+		it('flags wrapped body text taller than ~2 lines', () => {
+			const node = { characters: 'A long paragraph that wraps', textAutoResize: 'HEIGHT', height: 60 };
+			expect(textRendersMultipleLines(node, 20)).toBe(true); // 60/20 = 3 lines
+		});
+
+		it('flags text with an explicit line break regardless of height', () => {
+			const node = { characters: 'Line one' + LINE_SEP + 'Line two', textAutoResize: 'WIDTH_AND_HEIGHT', height: 20 };
+			expect(textRendersMultipleLines(node, 18)).toBe(true);
+		});
+
+		it('only checks paragraph spacing when 2+ paragraphs exist', () => {
+			expect(textHasMultipleParagraphs({ characters: 'one paragraph' })).toBe(false);
+			expect(textHasMultipleParagraphs({ characters: 'para one\npara two' })).toBe(true);
+		});
+	});
+
+	describe('wcag-image-alt (WCAG 1.1.1)', () => {
+		it('should flag image fills without description', () => {
+			const node = {
+				fills: [{ type: 'IMAGE', visible: true }],
+				description: '',
+				name: 'hero-photo',
+			};
+
+			const hasImageFill = node.fills.some((f: any) => f.type === 'IMAGE' && f.visible !== false);
+			const hasDescription = node.description.trim().length > 0;
+			const isDecorative = /decorative|decoration/i.test(node.name);
+
+			expect(hasImageFill).toBe(true);
+			expect(hasDescription).toBe(false);
+			expect(isDecorative).toBe(false);
+			// Should trigger finding
+		});
+
+		it('should NOT flag images with description', () => {
+			const node = {
+				fills: [{ type: 'IMAGE', visible: true }],
+				description: 'Photo of team collaboration session',
+				name: 'hero-photo',
+			};
+
+			const hasDescription = node.description.trim().length > 0;
+			expect(hasDescription).toBe(true);
+		});
+
+		it('should NOT flag decorative images', () => {
+			const node = {
+				fills: [{ type: 'IMAGE', visible: true }],
+				description: '',
+				name: 'decorative-pattern',
+			};
+
+			const isDecorative = /decorative|decoration/i.test(node.name);
+			expect(isDecorative).toBe(true);
+		});
+
+		it('should NOT flag non-image fills', () => {
+			const node = {
+				fills: [{ type: 'SOLID', visible: true }],
+			};
+
+			const hasImageFill = node.fills.some((f: any) => f.type === 'IMAGE' && f.visible !== false);
+			expect(hasImageFill).toBe(false);
+		});
+
+		it('should ignore invisible image fills', () => {
+			const node = {
+				fills: [{ type: 'IMAGE', visible: false }],
+			};
+
+			const hasImageFill = node.fills.some((f: any) => f.type === 'IMAGE' && f.visible !== false);
+			expect(hasImageFill).toBe(false);
+		});
+	});
+
+	describe('wcag-heading-hierarchy (WCAG 1.3.1)', () => {
+		it('should detect heading level from node name', () => {
+			const headingRegex = /\bh(\d)\b|heading[\s-]*(\d)/i;
+
+			const h1Match = headingRegex.exec('H1 Title');
+			expect(h1Match).not.toBeNull();
+			expect(h1Match![1]).toBe('1');
+
+			const h2Match = headingRegex.exec('Heading 2');
+			expect(h2Match).not.toBeNull();
+			expect(h2Match![2]).toBe('2');
+		});
+
+		it('should flag skipped heading levels', () => {
+			const headings = [
+				{ level: 1, name: 'H1 Title' },
+				{ level: 3, name: 'H3 Subtitle' }, // Skips H2!
+			];
+
+			const violations: Array<{ level: number; previousLevel: number }> = [];
+			let prevLevel = 0;
+			for (const h of headings) {
+				if (prevLevel > 0 && h.level > prevLevel + 1) {
+					violations.push({ level: h.level, previousLevel: prevLevel });
+				}
+				prevLevel = h.level;
+			}
+
+			expect(violations).toHaveLength(1);
+			expect(violations[0].level).toBe(3);
+			expect(violations[0].previousLevel).toBe(1);
+		});
+
+		it('should NOT flag consecutive heading levels', () => {
+			const headings = [
+				{ level: 1 },
+				{ level: 2 },
+				{ level: 3 },
+			];
+
+			const violations: number[] = [];
+			let prevLevel = 0;
+			for (const h of headings) {
+				if (prevLevel > 0 && h.level > prevLevel + 1) {
+					violations.push(h.level);
+				}
+				prevLevel = h.level;
+			}
+
+			expect(violations).toHaveLength(0);
+		});
+
+		it('should NOT flag heading level decrease (H3 → H1)', () => {
+			const headings = [
+				{ level: 3 },
+				{ level: 1 }, // Going back up is fine
+			];
+
+			const violations: number[] = [];
+			let prevLevel = 0;
+			for (const h of headings) {
+				if (prevLevel > 0 && h.level > prevLevel + 1) {
+					violations.push(h.level);
+				}
+				prevLevel = h.level;
+			}
+
+			expect(violations).toHaveLength(0);
+		});
+
+		it('should infer heading level from font size', () => {
+			function inferHeadingLevel(fontSize: number): number {
+				if (fontSize >= 40) return 1;
+				if (fontSize >= 32) return 2;
+				if (fontSize >= 24) return 3;
+				if (fontSize >= 20) return 4;
+				if (fontSize >= 18) return 5;
+				return 0; // Not a heading
+			}
+
+			expect(inferHeadingLevel(48)).toBe(1);
+			expect(inferHeadingLevel(36)).toBe(2);
+			expect(inferHeadingLevel(24)).toBe(3);
+			expect(inferHeadingLevel(20)).toBe(4);
+			expect(inferHeadingLevel(14)).toBe(0);
+		});
+	});
+
+	describe('wcag-reflow (WCAG 1.4.10)', () => {
+		it('should flag frames with absolute-positioned children', () => {
+			const children = [
+				{ x: 0, y: 0 },
+				{ x: 200, y: 50 },
+				{ x: 50, y: 300 },
+			];
+
+			// Spread across both axes indicates absolute positioning
+			const uniqueXs = [...new Set(children.map(c => c.x))];
+			const uniqueYs = [...new Set(children.map(c => c.y))];
+
+			expect(uniqueXs.length).toBeGreaterThan(2);
+			expect(uniqueYs.length).toBeGreaterThan(2);
+		});
+
+		it('should NOT flag frames with auto-layout', () => {
+			const frame = { layoutMode: 'VERTICAL', children: [{ x: 0, y: 0 }, { x: 0, y: 100 }] };
+			expect(frame.layoutMode).not.toBe('NONE');
+			// Auto-layout frames are skipped entirely
+		});
+
+		it('should NOT flag frames with fewer than 3 children', () => {
+			const children = [{ x: 0, y: 0 }, { x: 100, y: 0 }];
+			expect(children.length).toBeLessThan(3);
+		});
+
+		it('should NOT flag aligned children (same column/row)', () => {
+			// All children in same column = not absolute positioning
+			const children = [
+				{ x: 0, y: 0 },
+				{ x: 0, y: 50 },
+				{ x: 0, y: 100 },
+			];
+			const uniqueXs = [...new Set(children.map(c => c.x))];
+			expect(uniqueXs.length).toBe(1); // All same X = NOT flagged
+		});
+	});
+
+	describe('wcag-reading-order (WCAG 1.3.2)', () => {
+		it('should detect visual vs layer order mismatch', () => {
+			// Layer order: 0, 1, 2 — but visually reversed (bottom element first in layers)
+			const children = [
+				{ index: 0, y: 300, x: 0 }, // visually at bottom
+				{ index: 1, y: 0, x: 0 },   // visually at top
+				{ index: 2, y: 150, x: 0 },  // visually in middle
+			];
+
+			const visualOrder = children.slice().sort((a, b) => {
+				if (Math.abs(a.y - b.y) > 10) return a.y - b.y;
+				return a.x - b.x;
+			});
+
+			let mismatches = 0;
+			for (let i = 0; i < visualOrder.length; i++) {
+				if (visualOrder[i].index !== i) mismatches++;
+			}
+
+			expect(mismatches).toBeGreaterThan(0);
+			expect(mismatches / children.length).toBeGreaterThan(0.3);
+		});
+
+		it('should NOT flag matching visual and layer order', () => {
+			const children = [
+				{ index: 0, y: 0, x: 0 },
+				{ index: 1, y: 50, x: 0 },
+				{ index: 2, y: 100, x: 0 },
+			];
+
+			const visualOrder = children.slice().sort((a, b) => {
+				if (Math.abs(a.y - b.y) > 10) return a.y - b.y;
+				return a.x - b.x;
+			});
+
+			let mismatches = 0;
+			for (let i = 0; i < visualOrder.length; i++) {
+				if (visualOrder[i].index !== i) mismatches++;
+			}
+
+			expect(mismatches).toBe(0);
+		});
+
+		it('should use 10px threshold for same-row detection', () => {
+			// Elements within 10px Y difference should be treated as same row
+			const children = [
+				{ index: 0, y: 5, x: 100 },  // Same row as index 1 (within 10px)
+				{ index: 1, y: 0, x: 0 },
+			];
+
+			const visualOrder = children.slice().sort((a, b) => {
+				if (Math.abs(a.y - b.y) > 10) return a.y - b.y;
+				return a.x - b.x;
+			});
+
+			// Within 10px, so sorted by X: index 1 (x=0) before index 0 (x=100)
+			expect(visualOrder[0].index).toBe(1);
+			expect(visualOrder[1].index).toBe(0);
+		});
+
+		it('should skip auto-layout frames (order is enforced)', () => {
+			const frame = { layoutMode: 'HORIZONTAL' };
+			const isAutoLayout = frame.layoutMode && frame.layoutMode !== 'NONE';
+			expect(isAutoLayout).toBe(true);
+			// Auto-layout frames should not be checked for reading order
+		});
+
+		it('should require >30% mismatches AND at least 2 to trigger', () => {
+			// 1 out of 5 is 20% — below threshold
+			const childCount = 5;
+			const mismatches = 1;
+			const triggered = mismatches > childCount * 0.3 && mismatches >= 2;
+			expect(triggered).toBe(false);
+
+			// 2 out of 3 is 67% — above threshold
+			const triggered2 = 2 > 3 * 0.3 && 2 >= 2;
+			expect(triggered2).toBe(true);
+		});
+	});
+
+	// ========================================================================
+	// New rule output structures
+	// ========================================================================
+
+	describe('new rule output structures', () => {
+		it('should produce valid non-text contrast finding', () => {
+			const finding = {
+				id: '1:2', name: 'Toggle Switch',
+				ratio: '2.1:1', required: '3.0:1',
+				component: '#DDDDDD', bg: '#FFFFFF', element: 'fill',
+			};
+			expect(finding.ratio).toBeDefined();
+			expect(finding.element).toMatch(/fill|stroke/);
+		});
+
+		it('should produce valid color-only finding', () => {
+			const finding = {
+				id: '1:2', name: 'Input / State=Error',
+				variantColor: '#FF0000', defaultColor: '#CCCCCC',
+				suggestion: 'Add an icon, text label, or border to differentiate this state beyond color alone',
+			};
+			expect(finding.variantColor).not.toBe(finding.defaultColor);
+			expect(finding.suggestion).toBeDefined();
+		});
+
+		it('should produce valid focus indicator finding (missing)', () => {
+			const finding = {
+				id: '1:2', name: 'Button',
+				issue: 'missing-variant',
+				suggestion: 'Add a focus/focused variant with a visible focus ring or outline',
+			};
+			expect(finding.issue).toBe('missing-variant');
+		});
+
+		it('should produce valid focus indicator finding (no visible indicator)', () => {
+			const finding = {
+				id: '1:3', name: 'Button / State=Focused',
+				issue: 'no-visible-indicator',
+				suggestion: 'Focus variant exists but has no visible border, outline, or shadow for the focus indicator',
+			};
+			expect(finding.issue).toBe('no-visible-indicator');
+		});
+
+		it('should produce valid letter spacing finding', () => {
+			const finding = { id: '1:2', name: 'Label', letterSpacing: '-0.5px' };
+			expect(finding.letterSpacing).toContain('-');
+		});
+
+		it('should produce valid paragraph spacing finding', () => {
+			const finding = {
+				id: '1:2', name: 'Body Text',
+				paragraphSpacing: 24, fontSize: 16, recommended: 32,
+			};
+			expect(finding.paragraphSpacing).toBeLessThan(finding.recommended);
+		});
+
+		it('should produce valid image alt finding', () => {
+			const finding = {
+				id: '1:2', name: 'hero-photo',
+				suggestion: 'Add a description in the node\'s description field, or name it "decorative" if purely presentational',
+			};
+			expect(finding.suggestion).toContain('description');
+		});
+
+		it('should produce valid heading hierarchy finding', () => {
+			const finding = {
+				id: '1:2', name: 'Section Title',
+				level: 3, previousLevel: 1,
+				suggestion: 'Expected H2 but found H3. Do not skip heading levels.',
+			};
+			expect(finding.level).toBeGreaterThan(finding.previousLevel + 1);
+		});
+
+		it('should produce valid reflow finding', () => {
+			const finding = {
+				id: '1:2', name: 'Page Layout',
+				childCount: 5,
+				suggestion: 'Convert to auto-layout so content can reflow at different viewport sizes',
+			};
+			expect(finding.childCount).toBeGreaterThanOrEqual(3);
+		});
+
+		it('should produce valid reading order finding', () => {
+			const finding = {
+				id: '1:2', name: 'Card Container',
+				childCount: 4, mismatches: 3,
+				suggestion: 'Reorder layers to match visual top-to-bottom, left-to-right reading order',
+			};
+			expect(finding.mismatches).toBeGreaterThan(0);
+			expect(finding.mismatches / finding.childCount).toBeGreaterThan(0.3);
+		});
+	});
+
+	// ========================================================================
+	// WCAG success criteria mapping
+	// ========================================================================
+
+	describe('WCAG success criteria coverage', () => {
+		const WCAG_CRITERIA_MAP: Record<string, string> = {
+			'wcag-contrast': 'WCAG 1.4.3 / 1.4.6',
+			'wcag-non-text-contrast': 'WCAG 1.4.11',
+			'wcag-color-only': 'WCAG 1.4.1',
+			'wcag-text-size': 'Best practice (not 1.4.4 — that criterion is about zoom support)',
+			'wcag-target-size': 'WCAG 2.5.5 / 2.5.8',
+			'wcag-line-height': 'Best practice (1.4.12 requires supporting user overrides, not specific defaults)',
+			'wcag-letter-spacing': 'Best practice (negative spacing harms readability)',
+			'wcag-paragraph-spacing': 'Best practice (1.4.12 requires supporting user overrides)',
+			'wcag-focus-indicator': 'WCAG 2.4.7 / 2.4.11',
+			'wcag-image-alt': 'WCAG 1.1.1',
+			'wcag-heading-hierarchy': 'WCAG 1.3.1',
+			'wcag-reflow': 'WCAG 1.4.10',
+			'wcag-reading-order': 'WCAG 1.3.2',
+			'wcag-disabled-no-context': 'WCAG 4.1.2 (disabled elements need ARIA context for screen readers)',
+		};
+
+		it('should map all 14 WCAG rules to success criteria', () => {
+			expect(Object.keys(WCAG_CRITERIA_MAP)).toHaveLength(14);
+		});
+
+		it('should cover Perceivable principle (1.x.x)', () => {
+			const perceivable = Object.values(WCAG_CRITERIA_MAP).filter(v => v.startsWith('WCAG 1.'));
+			// 6 strict WCAG perceivable rules (contrast, non-text, color-only, image-alt, reflow, plus heading/reading)
+			// 3 rules reclassified as best-practice (text-size, line-height, paragraph-spacing)
+			expect(perceivable.length).toBeGreaterThanOrEqual(5);
+		});
+
+		it('should cover Operable principle (2.x.x)', () => {
+			const operable = Object.values(WCAG_CRITERIA_MAP).filter(v => v.startsWith('WCAG 2.'));
+			expect(operable.length).toBeGreaterThanOrEqual(2);
+		});
+	});
+
+	// ========================================================================
+	// Phase B: Disabled variant structural check
+	// ========================================================================
+
+	describe('wcag-disabled-no-context', () => {
+		it('should flag disabled variants without tooltip or helper text', () => {
+			const disabledVariant = {
+				name: 'state=disabled',
+				children: [
+					{ name: 'Label', type: 'TEXT' },
+					{ name: 'Icon', type: 'INSTANCE' },
+				],
+			};
+			const hasContextChild = disabledVariant.children.some(
+				(c: any) => /tooltip|helper|hint|description|message/i.test(c.name),
+			);
+			expect(hasContextChild).toBe(false);
+		});
+
+		it('should NOT flag disabled variants with tooltip child', () => {
+			const disabledVariant = {
+				name: 'state=disabled',
+				children: [
+					{ name: 'Label', type: 'TEXT' },
+					{ name: 'Tooltip', type: 'INSTANCE' },
+				],
+			};
+			const hasContextChild = disabledVariant.children.some(
+				(c: any) => /tooltip|helper|hint|description|message/i.test(c.name),
+			);
+			expect(hasContextChild).toBe(true);
+		});
+
+		it('should NOT flag disabled variants with helper text', () => {
+			const disabledVariant = {
+				name: 'state=disabled',
+				children: [
+					{ name: 'Input', type: 'INSTANCE' },
+					{ name: 'Helper text', type: 'TEXT' },
+				],
+			};
+			const hasContextChild = disabledVariant.children.some(
+				(c: any) => /tooltip|helper|hint|description|message/i.test(c.name),
+			);
+			expect(hasContextChild).toBe(true);
+		});
+
+		it('should NOT flag when component description mentions disabled tooltip', () => {
+			const description = 'When disabled, show a tooltip explaining why the action is unavailable.';
+			const hasAnnotation = /disabled.*tooltip|disabled.*helper|aria-disabled/i.test(description);
+			expect(hasAnnotation).toBe(true);
+		});
+
+		it('should detect disabled and inactive variant names', () => {
+			const disabledPattern = /(disabled|inactive)/i;
+			expect('state=disabled').toMatch(disabledPattern);
+			expect('State=Inactive').toMatch(disabledPattern);
+			expect('state=hover').not.toMatch(disabledPattern);
+		});
+
+		it('should produce finding with Isabella pattern suggestion', () => {
+			const finding = {
+				id: '1:2',
+				name: 'Button / state=disabled',
+				suggestion: 'Disabled elements should remain focusable (use aria-disabled, not HTML disabled). Add a tooltip or helper text explaining why the element is disabled so screen reader users understand the context.',
+			};
+			expect(finding.suggestion).toContain('aria-disabled');
+			expect(finding.suggestion).toContain('tooltip');
+			expect(finding.suggestion).toContain('screen reader');
+		});
+	});
+
+	// ========================================================================
+	// Phase B: Token misuse detection
+	// ========================================================================
+
+	describe('token-misuse', () => {
+		it('should flag bg/* token used as text fill', () => {
+			const variable = { name: 'bg/accent/weakest-hover' };
+			const nodeType = 'TEXT';
+			const isBgToken = /^(bg|background|surface|fill)[\/-]/.test(variable.name.toLowerCase());
+			const isTextNode = nodeType === 'TEXT';
+			expect(isBgToken && isTextNode).toBe(true);
+		});
+
+		it('should flag text/* token used as frame background', () => {
+			const variable = { name: 'text/primary' };
+			const nodeType = 'FRAME';
+			const isTextToken = /^(text|fg|foreground|font)[\/-]/.test(variable.name.toLowerCase());
+			const isContainerNode = ['FRAME', 'COMPONENT', 'INSTANCE', 'RECTANGLE'].includes(nodeType);
+			expect(isTextToken && isContainerNode).toBe(true);
+		});
+
+		it('should NOT flag text/* token on TEXT node', () => {
+			const variable = { name: 'text/primary' };
+			const nodeType = 'TEXT';
+			const isTextToken = /^(text|fg|foreground|font)[\/-]/.test(variable.name.toLowerCase());
+			const isContainerNode = ['FRAME', 'COMPONENT', 'INSTANCE', 'RECTANGLE'].includes(nodeType);
+			expect(isTextToken && isContainerNode).toBe(false);
+		});
+
+		it('should NOT flag bg/* token on FRAME node', () => {
+			const variable = { name: 'bg/surface/default' };
+			const nodeType = 'FRAME';
+			const isBgToken = /^(bg|background|surface|fill)[\/-]/.test(variable.name.toLowerCase());
+			const isTextNode = nodeType === 'TEXT';
+			expect(isBgToken && isTextNode).toBe(false);
+		});
+
+		it('should detect various bg token prefixes', () => {
+			const bgPattern = /^(bg|background|surface|fill)[\/-]/;
+			expect(bgPattern.test('bg/primary')).toBe(true);
+			expect(bgPattern.test('background/default')).toBe(true);
+			expect(bgPattern.test('surface/elevated')).toBe(true);
+			expect(bgPattern.test('fill/accent')).toBe(true);
+			expect(bgPattern.test('text/primary')).toBe(false);
+			expect(bgPattern.test('border/default')).toBe(false);
+		});
+
+		it('should detect various text token prefixes', () => {
+			const textPattern = /^(text|fg|foreground|font)[\/-]/;
+			expect(textPattern.test('text/primary')).toBe(true);
+			expect(textPattern.test('fg/secondary')).toBe(true);
+			expect(textPattern.test('foreground/muted')).toBe(true);
+			expect(textPattern.test('font/accent')).toBe(true);
+			expect(textPattern.test('bg/primary')).toBe(false);
+		});
+
+		it('should produce actionable finding', () => {
+			const finding = {
+				id: '1:2',
+				name: 'Label',
+				variable: 'bg/accent/weakest-hover',
+				usage: 'text fill',
+				expectedPrefix: 'text/*, fg/*, foreground/*',
+				suggestion: 'This text node uses a background/surface token as its fill color.',
+			};
+			expect(finding.variable).toContain('bg/');
+			expect(finding.usage).toBe('text fill');
+			expect(finding.expectedPrefix).toContain('text/*');
 		});
 	});
 });

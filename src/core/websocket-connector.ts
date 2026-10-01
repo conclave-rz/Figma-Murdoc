@@ -14,6 +14,47 @@ import { createChildLogger } from './logger.js';
 
 const logger = createChildLogger({ component: 'websocket-connector' });
 
+/**
+ * Number of variants a CREATE_COMPONENT_SET request will produce:
+ * Mode B = componentIds.length; Mode A = the cartesian product of the
+ * property axes ({State:[a,b,c], Size:[s,l]} → 6).
+ */
+export function componentSetVariantCount(params: {
+  properties?: Record<string, string[]>;
+  componentIds?: string[];
+}): number {
+  if (params.componentIds?.length) return params.componentIds.length;
+  if (params.properties) {
+    let count = 1;
+    for (const values of Object.values(params.properties)) {
+      count *= Math.max(1, values?.length ?? 1);
+    }
+    return count;
+  }
+  return 1;
+}
+
+/**
+ * Server-hop timeout for CREATE_COMPONENT_SET, scaled by variant count.
+ * The plugin builds all variants in ONE uncancellable pass, so timing out
+ * early doesn't stop the work — it just makes the report contradict the
+ * file state (set gets created after the "failure") and invites duplicate
+ * retries. Budget ~1.2s per variant with a 30s floor and 120s cap, plus a
+ * 5s buffer over the ui.html hop (which uses the same base formula) so the
+ * plugin-side result or error always wins the race.
+ *
+ * NOTE: ui.html's CREATE_COMPONENT_SET route and
+ * cloud-websocket-connector.ts mirror the base formula — keep all three in
+ * sync.
+ */
+export function componentSetTimeoutMs(params: {
+  properties?: Record<string, string[]>;
+  componentIds?: string[];
+}): number {
+  const count = componentSetVariantCount(params);
+  return Math.min(120000, Math.max(30000, count * 1200)) + 5000;
+}
+
 export class WebSocketConnector implements IFigmaConnector {
   private wsServer: FigmaWebSocketServer;
 
@@ -30,7 +71,7 @@ export class WebSocketConnector implements IFigmaConnector {
     logger.info('WebSocket connector initialized');
   }
 
-  getTransportType(): 'cdp' | 'websocket' {
+  getTransportType(): 'websocket' {
     return 'websocket';
   }
 
@@ -48,32 +89,41 @@ export class WebSocketConnector implements IFigmaConnector {
   }
 
   async getVariables(fileKey?: string): Promise<any> {
-    // Execute the same variables-fetching code in the plugin worker context
+    // Execute the same variables-fetching code in the plugin worker context.
+    //
+    // IMPORTANT: Do NOT wrap this in an inner `(async () => { ... })()` IIFE.
+    // figma-desktop-bridge/code.js already wraps every EXECUTE_CODE payload in
+    // `(async function() { <code> })()`. An inner IIFE turns `return X` into a
+    // statement-expression that builds (but doesn't return) a Promise — the
+    // outer async returns undefined, and the result is silently dropped. See
+    // issue #68. The bare try/catch with top-level `return` is the contract
+    // code.js expects.
     const code = `
-      (async () => {
-        try {
-          if (typeof figma === 'undefined') {
-            throw new Error('Figma API not available in this context');
-          }
-          const variables = await figma.variables.getLocalVariablesAsync();
-          const collections = await figma.variables.getLocalVariableCollectionsAsync();
-          return {
-            success: true,
-            timestamp: Date.now(),
-            fileMetadata: { fileName: figma.root.name, fileKey: figma.fileKey || null },
-            variables: variables.map(function(v) { return { id: v.id, name: v.name, key: v.key, resolvedType: v.resolvedType, valuesByMode: v.valuesByMode, variableCollectionId: v.variableCollectionId, scopes: v.scopes, description: v.description, hiddenFromPublishing: v.hiddenFromPublishing }; }),
-            variableCollections: collections.map(function(c) { return { id: c.id, name: c.name, key: c.key, modes: c.modes, defaultModeId: c.defaultModeId, variableIds: c.variableIds }; })
-          };
-        } catch (error) {
-          return { success: false, error: error.message };
+      try {
+        if (typeof figma === 'undefined') {
+          throw new Error('Figma API not available in this context');
         }
-      })()
+        const variables = await figma.variables.getLocalVariablesAsync();
+        const collections = await figma.variables.getLocalVariableCollectionsAsync();
+        return {
+          success: true,
+          timestamp: Date.now(),
+          fileMetadata: { fileName: figma.root.name, fileKey: figma.fileKey || null },
+          variables: variables.map(function(v) { return { id: v.id, name: v.name, key: v.key, resolvedType: v.resolvedType, valuesByMode: v.valuesByMode, variableCollectionId: v.variableCollectionId, scopes: v.scopes, description: v.description, hiddenFromPublishing: v.hiddenFromPublishing }; }),
+          variableCollections: collections.map(function(c) { return { id: c.id, name: c.name, key: c.key, modes: c.modes, defaultModeId: c.defaultModeId, variableIds: c.variableIds }; })
+        };
+      } catch (error) {
+        return { success: false, error: error.message };
+      }
     `;
     return this.wsServer.sendCommand('EXECUTE_CODE', { code, timeout: 30000 }, 32000, fileKey);
   }
 
-  async executeCodeViaUI(code: string, timeoutMs = 5000): Promise<any> {
-    return this.wsServer.sendCommand('EXECUTE_CODE', { code, timeout: timeoutMs }, timeoutMs + 2000);
+  async executeCodeViaUI(code: string, timeoutMs = 5000, fileKey?: string): Promise<any> {
+    // fileKey is optional — when passed, routes to that specific connected
+    // client instead of the active file (see sendCommand's targetFileKey),
+    // so code can run against a non-active file without switching to it.
+    return this.wsServer.sendCommand('EXECUTE_CODE', { code, timeout: timeoutMs }, timeoutMs + 2000, fileKey);
   }
 
   // ============================================================================
@@ -154,8 +204,8 @@ export class WebSocketConnector implements IFigmaConnector {
   // Component operations
   // ============================================================================
 
-  async getComponentFromPluginUI(nodeId: string): Promise<any> {
-    return this.wsServer.sendCommand('GET_COMPONENT', { nodeId }, 10000);
+  async getComponentFromPluginUI(nodeId: string, fileKey?: string): Promise<any> {
+    return this.wsServer.sendCommand('GET_COMPONENT', { nodeId }, 10000, fileKey);
   }
 
   async getLocalComponents(): Promise<any> {
@@ -170,8 +220,8 @@ export class WebSocketConnector implements IFigmaConnector {
   // Annotation operations
   // ============================================================================
 
-  async getAnnotations(nodeId: string, includeChildren?: boolean, depth?: number): Promise<any> {
-    return this.wsServer.sendCommand('GET_ANNOTATIONS', { nodeId, includeChildren, depth }, 10000);
+  async getAnnotations(nodeId: string, includeChildren?: boolean, depth?: number, fileKey?: string): Promise<any> {
+    return this.wsServer.sendCommand('GET_ANNOTATIONS', { nodeId, includeChildren, depth }, 10000, fileKey);
   }
 
   async setAnnotations(nodeId: string, annotations: any[], mode?: 'replace' | 'append'): Promise<any> {
@@ -199,6 +249,7 @@ export class WebSocketConnector implements IFigmaConnector {
   ): Promise<any> {
     const params: any = { nodeId, propertyName, propertyType: type, defaultValue };
     if (options?.preferredValues) params.preferredValues = options.preferredValues;
+    if (options?.description) params.description = options.description;
     return this.wsServer.sendCommand('ADD_COMPONENT_PROPERTY', params);
   }
 
@@ -221,6 +272,56 @@ export class WebSocketConnector implements IFigmaConnector {
       if (options.parentId) params.parentId = options.parentId;
     }
     return this.wsServer.sendCommand('INSTANTIATE_COMPONENT', params);
+  }
+
+  async createComponentSet(params: {
+    baseComponentId?: string;
+    properties?: Record<string, string[]>;
+    componentIds?: string[];
+    variantProperties?: Array<Record<string, string>>;
+    name?: string;
+    parentId?: string;
+    position?: { x: number; y: number };
+  }): Promise<any> {
+    // Cloning + combining large variant matrices is slow on heavy components
+    // and the plugin-side pass is uncancellable — a fixed 30s ceiling made a
+    // 48-variant set REPORT failure while the plugin kept going and created
+    // the set anyway (retry → duplicates). Scale the timeout with variant
+    // count instead (precedent: the token-import create phase).
+    return this.wsServer.sendCommand(
+      'CREATE_COMPONENT_SET',
+      params,
+      componentSetTimeoutMs(params),
+    );
+  }
+
+  // ============================================================================
+  // Slot operations
+  // ============================================================================
+
+  async createSlot(nodeId: string, options?: { name?: string; width?: number; height?: number; layoutMode?: string }): Promise<any> {
+    return this.wsServer.sendCommand('CREATE_SLOT', { nodeId, ...options });
+  }
+
+  async getSlots(nodeId: string): Promise<any> {
+    return this.wsServer.sendCommand('GET_SLOTS', { nodeId });
+  }
+
+  async appendToSlot(params: {
+    slotId?: string;
+    instanceId?: string;
+    slotName?: string;
+    sourceNodeId?: string;
+    nodeType?: string;
+    properties?: Record<string, string | number>;
+    clone?: boolean;
+    clearExisting?: boolean;
+  }): Promise<any> {
+    return this.wsServer.sendCommand('APPEND_TO_SLOT', params);
+  }
+
+  async resetSlot(params: { slotId?: string; instanceId?: string; slotName?: string }): Promise<any> {
+    return this.wsServer.sendCommand('RESET_SLOT', params);
   }
 
   // ============================================================================
@@ -271,6 +372,7 @@ export class WebSocketConnector implements IFigmaConnector {
       if (options.fontSize) params.fontSize = options.fontSize;
       if (options.fontWeight) params.fontWeight = options.fontWeight;
       if (options.fontFamily) params.fontFamily = options.fontFamily;
+      if (options.fontStyle) params.fontStyle = options.fontStyle;
     }
     return this.wsServer.sendCommand('SET_TEXT_CONTENT', params);
   }
@@ -316,6 +418,17 @@ export class WebSocketConnector implements IFigmaConnector {
   }
 
   // ============================================================================
+  // Component accessibility audit
+  // ============================================================================
+
+  async auditComponentAccessibility(nodeId?: string, targetSize?: number): Promise<any> {
+    const params: any = {};
+    if (nodeId) params.nodeId = nodeId;
+    if (targetSize !== undefined) params.targetSize = targetSize;
+    return this.wsServer.sendCommand('AUDIT_COMPONENT_ACCESSIBILITY', params, 120000);
+  }
+
+  // ============================================================================
   // FigJam operations
   // ============================================================================
 
@@ -327,12 +440,16 @@ export class WebSocketConnector implements IFigmaConnector {
     return this.wsServer.sendCommand('CREATE_STICKIES', params, 30000);
   }
 
-  async createConnector(params: { startNodeId: string; endNodeId: string; label?: string }): Promise<any> {
+  async createConnector(params: { startNodeId: string; endNodeId: string; label?: string; startMagnet?: string; endMagnet?: string }): Promise<any> {
     return this.wsServer.sendCommand('CREATE_CONNECTOR', params);
   }
 
-  async createShapeWithText(params: { text?: string; shapeType?: string; x?: number; y?: number }): Promise<any> {
+  async createShapeWithText(params: { text?: string; shapeType?: string; x?: number; y?: number; width?: number; height?: number; fillColor?: string; strokeColor?: string; fontSize?: number; strokeDashPattern?: string }): Promise<any> {
     return this.wsServer.sendCommand('CREATE_SHAPE_WITH_TEXT', params);
+  }
+
+  async createSection(params: { name?: string; x?: number; y?: number; width?: number; height?: number; fillColor?: string }): Promise<any> {
+    return this.wsServer.sendCommand('CREATE_SECTION', params);
   }
 
   async createTable(params: { rows: number; columns: number; data?: string[][]; x?: number; y?: number }): Promise<any> {
@@ -407,12 +524,20 @@ export class WebSocketConnector implements IFigmaConnector {
     return this.wsServer.sendCommand('SKIP_SLIDE', params, 5000);
   }
 
-  async addTextToSlide(params: { slideId: string; text: string; x?: number; y?: number; fontSize?: number }): Promise<any> {
+  async addTextToSlide(params: { slideId: string; text: string; x?: number; y?: number; fontSize?: number; fontFamily?: string; fontStyle?: string; color?: string; textAlign?: string; width?: number; lineHeight?: number; letterSpacing?: number; textCase?: string }): Promise<any> {
     return this.wsServer.sendCommand('ADD_TEXT_TO_SLIDE', params, 10000);
   }
 
   async addShapeToSlide(params: { slideId: string; shapeType: string; x: number; y: number; width: number; height: number; fillColor?: string }): Promise<any> {
     return this.wsServer.sendCommand('ADD_SHAPE_TO_SLIDE', params, 5000);
+  }
+
+  async setSlideBackground(params: { slideId: string; color: string }): Promise<any> {
+    return this.wsServer.sendCommand('SET_SLIDE_BACKGROUND', params, 5000);
+  }
+
+  async getTextStyles(): Promise<any> {
+    return this.wsServer.sendCommand('GET_TEXT_STYLES', {}, 5000);
   }
 
   // ============================================================================

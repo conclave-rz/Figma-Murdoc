@@ -36,21 +36,23 @@ The MCP server has **three execution modes** and **four setup methods**:
 
 | Mode | Tools Available | Write Access | Needs Node.js | Real-time |
 |------|-----------------|--------------|---------------|-----------|
-| **Local Mode** (NPX or Git) | **90+** | Yes | Yes | Yes |
-| **Cloud Mode** (Remote + Relay) | **43** | Yes | No | No |
-| **Remote Mode** (read-only) | **22** | No | No | No |
+| **Local Mode** (NPX or Git) | **121** | Yes | Yes | Yes |
+| **Cloud Mode** (Remote + Relay) | **96** | Yes | No | No |
+| **Remote Mode** (read-only) | Read-only subset | No | No | No |
 
-> **Bottom line:** Remote mode is read-only (79 tools). Cloud Mode adds write access ((79 tools)) without Node.js. Local has everything (90+ tools) including real-time monitoring.
+> **Bottom line:** Remote mode is read-only until you pair the plugin. Cloud Mode adds write access (96 tools) without Node.js. Local has everything (121 tools) including real-time monitoring.
+
+> **Two hosted endpoints.** The Cloud Mode count is for the `/mcp` endpoint that web AI clients use. The `/sse` endpoint that Claude Desktop and Claude Code connect to also lists the console-log, screenshot, navigation, status, and reload tools, which need a headless browser session that only `/sse` keeps open. Remote mode is either endpoint before you pair the plugin.
 
 ### Use NPX Setup (Recommended for Most Users)
-- ✅ **All 90+ tools** including design creation and real-time monitoring
+- ✅ **All 121 tools** including design creation and real-time monitoring
 - ✅ Automatic updates with `@latest`
 - ✅ Desktop Bridge Plugin support (recommended connection — no debug flags needed)
 - ✅ Variables without Enterprise plan
 - ⚠️ Requires Node.js 18+ and `FIGMA_ACCESS_TOKEN` (manual, one-time)
 
 ### Use Cloud Mode (Web AI Clients)
-- ✅ **(79 tools)** — full write access (create, edit, delete) plus REST API reads
+- ✅ **96 tools** — full write access (create, edit, delete) plus REST API reads
 - ✅ No Node.js required — only Figma Desktop with the Desktop Bridge plugin
 - ✅ Works with Claude.ai, v0, Replit, Lovable, any MCP-capable web platform
 - ✅ Variables without Enterprise plan (via Plugin API)
@@ -58,7 +60,7 @@ The MCP server has **three execution modes** and **four setup methods**:
 - ❌ No real-time selection tracking, document changes, or console streaming
 
 ### Use Local Git (For Contributors)
-- ✅ **All 90+ tools** including design creation
+- ✅ **All 121 tools** including design creation
 - ✅ Full source code access
 - ✅ Modify and test changes
 - ⚠️ Requires `FIGMA_ACCESS_TOKEN` (manual)
@@ -68,7 +70,7 @@ The MCP server has **three execution modes** and **four setup methods**:
 - ✅ **TRUE zero-setup** - Just paste a URL
 - ✅ **OAuth authentication** - No manual tokens
 - ✅ Works without Figma Desktop restart
-- ❌ **Only 9 tools** — cannot create or modify designs
+- ❌ **Read-only** — cannot create or modify designs
 - ❌ Cannot use Desktop Bridge plugin
 - ❌ Variables require Enterprise plan
 
@@ -88,7 +90,7 @@ The MCP server has **three execution modes** and **four setup methods**:
 | **Desktop Bridge** | ❌ Not available | ✅ Required for relay | ✅ Available | ✅ Available |
 | **Node.js Required** | No | No | Yes | Yes |
 | **Source Access** | No | No | No | Yes |
-| **Tools** | 22 (read-only) | 43 (read/write) | 57+ (full) | 57+ (full) |
+| **Tools** | Read-only subset | 96 (read/write) | 121 (full) | 121 (full) |
 | **Use Case** | Quick evaluation | Web AI clients | Most users | Developers |
 
 ---
@@ -101,12 +103,16 @@ The MCP server has **three execution modes** and **four setup methods**:
 | **Design Creation (write)** | ❌ | ✅ | ✅ | Cloud via relay, Local via WebSocket |
 | **Variable Management** | ⚠️ | ✅ | ✅ | Remote requires Enterprise. Cloud/Local use Plugin API (any plan) |
 | **Screenshots** | ✅ | ✅ | ✅ | All use Figma REST API |
-| **Design System Extraction** | ✅ | ✅ | ✅ | Variables, components, styles via Figma API |
+| **Design System Reads** | ✅ | ✅ | ✅ | Variables, components, styles via Figma API |
+| **Codebase → Design System Extraction** (`figma_ds_*`) | ❌ | ❌ | ✅ | Local-only — reads and writes your local filesystem |
+| **Design-System Health Report** (`figma_audit_design_system_report`) | ❌ | ❌ | ✅ | Local-only |
+| **Component Search & Summaries** (`figma_search_components`, `figma_get_component_details`, `figma_get_design_system_summary`, `figma_get_token_values`) | ❌ | ❌ | ✅ | Local-only; Cloud Mode can use `figma_get_design_system_kit` and the library tools |
+| **Multi-File Execution** (`figma_execute_across_files`, `fileKey` targeting) | ❌ | ❌ | ✅ | Cloud Mode pairs with one plugin instance |
 | **Desktop Bridge Plugin** | ❌ | ✅ (required) | ✅ | Plugin required for Cloud relay and Local write access |
 | **Real-time Selection Tracking** | ❌ | ❌ | ✅ | Local-only — requires persistent WebSocket |
 | **Document Change Monitoring** | ❌ | ❌ | ✅ | Local-only — requires persistent WebSocket |
 | **Console Log Streaming** | ❌ | ❌ | ✅ | Local-only — zero-latency via WebSocket |
-| **Console Logs (on-demand)** | ✅ | ✅ | ✅ | Remote uses Browser Rendering API |
+| **Console Logs (on-demand)** | ✅ | ✅ | ✅ | Remote uses Browser Rendering API; Cloud + Local use the Desktop Bridge plugin |
 | **OAuth Authentication** | ✅ | ❌ | ❌ | Remote SSE only |
 | **Zero Setup** | ✅ | ❌ | ❌ | Remote: just paste URL |
 | **No Node.js Required** | ✅ | ✅ | ❌ | Cloud Mode only needs Figma Desktop + plugin |
@@ -129,19 +135,19 @@ Claude Desktop/Code
     ↓ (SSE over HTTPS)
 Cloudflare Workers MCP Server
     ↓ (Browser Rendering API)
-Puppeteer Browser (in CF Workers)
-    ↓ (HTTP)
+Headless Browser (in CF Workers)
+    ↓ (HTTPS)
 Figma Web App
     ↓ (REST API)
 Figma Files & Design Data
 ```
 
 **Key Points:**
-- Browser runs in Cloudflare's infrastructure
+- Headless browser runs in Cloudflare's infrastructure (Browser Rendering API)
 - Cannot access `localhost` on your machine
 - OAuth tokens stored in Cloudflare KV
 - ~10-30s cold start for first request
-- 9 read-only tools
+- Read-only tools (REST API reads, console/screenshot/navigate via headless browser)
 
 ### Cloud Mode Architecture (Read/Write via Relay)
 ```
@@ -162,7 +168,7 @@ Figma Design Data
 - No Node.js required — relay runs entirely in Cloudflare Workers
 - Desktop Bridge plugin connects to the cloud relay via WebSocket
 - Pairing flow: AI generates 6-character code → user enters in plugin → connected
-- (79 tools): 1 pairing + 27 write tools + 15 REST API reads
+- 96 tools available after pairing — write/manipulation + REST API reads + design system + slides + figjam + annotations + comments + version history
 - Variables work on any Figma plan (uses Plugin API, not Enterprise REST API)
 - Pairing code expires after 5 minutes
 
@@ -180,7 +186,7 @@ Variables & Components Data
 **Key Points:**
 - Install the Desktop Bridge Plugin once — no debug flags needed
 - Server automatically selects an available port (9223–9232) for multi-instance support
-- All 90+ tools work through WebSocket
+- All 121 tools work through WebSocket
 - Plugin can access local variables (no Enterprise API needed)
 - Instant console log capture via WebSocket
 - Real-time selection tracking and document change monitoring
@@ -193,7 +199,7 @@ Variables & Components Data
 
 | Tool | Remote | Local | Notes |
 |------|--------|-------|-------|
-| `figma_navigate` | ✅ | ✅ | Remote navigates cloud browser, Local navigates Figma Desktop |
+| `figma_navigate` | ✅ | ✅ | Remote navigates the cloud headless browser; Local switches the active file among connected plugins |
 | `figma_get_console_logs` | ✅ | ✅ | Both capture logs, Local has lower latency |
 | `figma_watch_console` | ✅ | ✅ | Real-time log streaming |
 | `figma_take_screenshot` | ✅ | ✅ | Both use Figma REST API |
@@ -247,7 +253,7 @@ Variables & Components Data
 2. Tell your AI to connect to your Figma plugin (natural language)
 3. AI generates a 6-character pairing code
 4. In the Desktop Bridge plugin, toggle "Cloud Mode" and enter the code
-5. Done ✅ — 79 tools with full write access
+5. Done ✅ — 96 tools with full write access
 
 ### NPX
 **Prerequisites:**
@@ -342,7 +348,7 @@ Variables & Components Data
 - ✅ Works offline (for console debugging)
 - ✅ No browser-based OAuth flow
 - ✅ Simpler for single-user setups
-- ✅ Full 90+ tools including real-time monitoring
+- ✅ Full 121 tools including real-time monitoring
 
 **Limitations:**
 - ❌ **Manual token creation required**
@@ -383,9 +389,9 @@ The Desktop Bridge Plugin is the bridge between Figma and the MCP server. It com
 | Selection tracking | ❌ | ❌ | ✅ Real-time via WebSocket |
 | Document change monitoring | ❌ | ❌ | ✅ Real-time via WebSocket |
 
-**Local Mode Transport:** The server automatically selects an available port in the range 9223–9232, supporting multiple simultaneous MCP instances. All 90+ tools work through the WebSocket transport.
+**Local Mode Transport:** The server automatically selects an available port in the range 9223–9232, supporting multiple simultaneous MCP instances. All 121 tools work through the WebSocket transport.
 
-**Cloud Mode Transport:** The plugin connects to the Cloudflare relay after pairing. Write operations are relayed from the cloud MCP server through the Durable Object to the plugin. (79 tools) are available.
+**Cloud Mode Transport:** The plugin connects to the Cloudflare relay after pairing. Write operations are relayed from the cloud MCP server through the Durable Object to the plugin. 96 tools are available.
 
 ### Plugin Does NOT Work with Remote Read-Only Mode
 
@@ -403,13 +409,15 @@ Remote read-only mode runs in Cloudflare Workers which cannot connect to `localh
 ### Switch from Remote (read-only) → NPX/Local Git if:
 - ❌ You need real-time selection tracking or document change monitoring
 - ❌ You're developing Figma plugins (need console log streaming)
-- ❌ You need the full 90+ tool set
+- ❌ You need the full Local Mode tool set
 - ❌ You need offline access
 
 ### Switch from Cloud Mode → NPX/Local Git if:
 - ❌ You need real-time selection tracking or document changes
 - ❌ You need console log streaming
 - ❌ You need MCP Apps (Token Browser, Design System Dashboard)
+- ❌ You want to extract a design system from a codebase (`figma_ds_*` tools)
+- ❌ You need the design-system health report, component search, or multi-file execution
 - ❌ Connection drops between AI turns are disruptive to your workflow
 
 ### Switch from NPX/Local Git → Cloud Mode if:
@@ -470,7 +478,7 @@ All setup methods are completely free:
 ### Cloud Mode Common Issues
 - **Pairing code expired** → Ask your AI to generate a new pairing code (codes expire after 5 minutes)
 - **Connection drops between AI turns** → Re-pair by asking your AI to reconnect and entering a fresh code in the plugin
-- **"Cloud Mode" toggle not visible** → Re-import the manifest from `~/.figma-console-mcp/plugin/manifest.json` (one-time update to the bootloader version)
+- **"Cloud Mode" toggle not visible** → Re-import the manifest from `~/.figma-console-mcp/plugin/manifest.json` to refresh Figma's cached plugin code (Cloud Mode was added in v1.12.0)
 - **Plugin shows "Disconnected" in Cloud Mode** → Check your internet connection; the relay requires both the plugin and the cloud server to be online
 - **Write operations not working** → Verify the Desktop Bridge plugin is running in the file you want to modify
 
@@ -485,7 +493,7 @@ All setup methods are completely free:
 ## Summary
 
 **For most users: Start with NPX Setup** ⭐
-- All 90+ tools including design creation and real-time monitoring
+- All 121 tools including design creation and real-time monitoring
 - Automatic updates with `@latest`
 - Desktop Bridge plugin support
 - Variables without Enterprise plan
@@ -508,9 +516,9 @@ All setup methods are completely free:
 - You don't need design creation capabilities
 
 **Key Takeaway:** The three modes offer a clear capability progression:
-- **Remote (read-only):** 22 tools — view data, screenshots, design system extraction
-- **Cloud Mode:** (79 tools) — adds full write access (create, edit, delete) via relay
-- **Local Mode (NPX/Git):** 90+ tools — adds real-time monitoring (selection, changes, console)
+- **Remote (read-only):** view data, screenshots, design system extraction
+- **Cloud Mode:** 96 tools — adds full write access (create, edit, delete) via relay
+- **Local Mode (NPX/Git):** 121 tools — adds real-time monitoring (selection, changes, console)
 
 The difference is not just authentication, but **fundamental capabilities**:
 - **Remote:** Cannot create, modify, or delete anything in Figma

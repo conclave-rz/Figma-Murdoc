@@ -8,13 +8,13 @@ import { z } from "zod";
 import * as fs from "fs";
 import * as path from "path";
 import type { FigmaAPI, FigmaUrlInfo } from "./figma-api.js";
-import { extractFileKey, extractFigmaUrlInfo, formatVariables, formatComponentData, withTimeout } from "./figma-api.js";
+import { extractFileKey, extractFigmaUrlInfo, formatVariables, formatComponentData, withTimeout, normalizeNodeId } from "./figma-api.js";
 import { createChildLogger } from "./logger.js";
+import { identifiedError, withIdentity } from "./identity.js";
 import { EnrichmentService } from "./enrichment/index.js";
 import type { EnrichmentOptions } from "./types/enriched.js";
-import { SnippetInjector } from "./snippet-injector.js";
-import type { ConsoleMonitor } from "./console-monitor.js";
 import { extractNodeSpec, validateReconstructionSpec, listVariants } from "./figma-reconstruction-spec.js";
+import { augmentWithExtendedCollections, countOverrides, extendedCollectionView } from "./extended-collections.js";
 
 const logger = createChildLogger({ component: "figma-tools" });
 
@@ -83,9 +83,6 @@ function scanCodebaseComponents(componentsDir: string): { name: string; path: st
 	return registry;
 }
 
-// Initialize snippet injector
-const snippetInjector = new SnippetInjector();
-
 // ============================================================================
 // Cache Management & Data Processing Helpers
 // ============================================================================
@@ -148,7 +145,13 @@ function adaptiveResponse(
 		suggestedActions?: string[];
 	}
 ): { content: any[] } {
-	const sizeKB = calculateSizeKB(responseData);
+	// Tag every response with our MCP identity so LLMs can attribute it
+	// unambiguously when other Figma-related MCPs are also connected.
+	const tagged = responseData && typeof responseData === "object" && !Array.isArray(responseData)
+		? withIdentity(responseData as Record<string, unknown>)
+		: { _mcp: "figma-console-mcp", data: responseData };
+
+	const sizeKB = calculateSizeKB(tagged);
 
 	// No compression needed
 	if (sizeKB <= RESPONSE_SIZE_THRESHOLDS.IDEAL_SIZE_KB) {
@@ -156,32 +159,39 @@ function adaptiveResponse(
 			content: [
 				{
 					type: "text",
-					text: JSON.stringify(responseData),
+					text: JSON.stringify(tagged),
 				},
 			],
 		};
 	}
 
-	// Determine compression level and message
+	// Determine compression level and message. The "AUTO-COMPRESSED" wording is
+	// only truthful when a compressionCallback actually runs — without one the
+	// full payload is returned and the banner must say so instead of claiming
+	// a reduction that never happened.
 	let compressionLevel: "info" | "warning" | "critical" | "emergency" = "info";
 	let aiInstruction = "";
 	let shouldCompress = false;
+	const canCompress = !!options.compressionCallback;
 
 	if (sizeKB > RESPONSE_SIZE_THRESHOLDS.MAX_SIZE_KB) {
 		compressionLevel = "emergency";
 		shouldCompress = true;
-		aiInstruction =
-			`⚠️ RESPONSE AUTO-COMPRESSED: The ${options.toolName} response was automatically reduced because the full response would be ${sizeKB.toFixed(0)}KB, which would exhaust Claude Desktop's context window.\n\n`;
+		aiInstruction = canCompress
+			? `⚠️ RESPONSE AUTO-COMPRESSED: The ${options.toolName} response was automatically reduced because the full response would be ${sizeKB.toFixed(0)}KB, which would exhaust Claude Desktop's context window.\n\n`
+			: `⚠️ LARGE RESPONSE: The ${options.toolName} response is ${sizeKB.toFixed(0)}KB and may exhaust the context window. Retry with filters or pagination to reduce it.\n\n`;
 	} else if (sizeKB > RESPONSE_SIZE_THRESHOLDS.CRITICAL_SIZE_KB) {
 		compressionLevel = "critical";
 		shouldCompress = true;
-		aiInstruction =
-			`⚠️ RESPONSE AUTO-COMPRESSED: The ${options.toolName} response was automatically reduced because it would be ${sizeKB.toFixed(0)}KB, risking context window exhaustion.\n\n`;
+		aiInstruction = canCompress
+			? `⚠️ RESPONSE AUTO-COMPRESSED: The ${options.toolName} response was automatically reduced because it would be ${sizeKB.toFixed(0)}KB, risking context window exhaustion.\n\n`
+			: `⚠️ LARGE RESPONSE: The ${options.toolName} response is ${sizeKB.toFixed(0)}KB, risking context window exhaustion. Retry with filters or pagination to reduce it.\n\n`;
 	} else if (sizeKB > RESPONSE_SIZE_THRESHOLDS.WARNING_SIZE_KB) {
 		compressionLevel = "warning";
 		shouldCompress = true;
-		aiInstruction =
-			`ℹ️ RESPONSE OPTIMIZED: The ${options.toolName} response was automatically reduced because it would be ${sizeKB.toFixed(0)}KB.\n\n`;
+		aiInstruction = canCompress
+			? `ℹ️ RESPONSE OPTIMIZED: The ${options.toolName} response was automatically reduced because it would be ${sizeKB.toFixed(0)}KB.\n\n`
+			: `ℹ️ LARGE RESPONSE: The ${options.toolName} response is ${sizeKB.toFixed(0)}KB. Filters or pagination can reduce it.\n\n`;
 	}
 
 	// Map compression level to verbosity level
@@ -226,11 +236,15 @@ function adaptiveResponse(
 		}
 	}
 
-	// Build response content
+	// Build response content (tagged with identity so cross-MCP attribution is clear)
+	const taggedFinal = finalData && typeof finalData === "object" && !Array.isArray(finalData)
+		? withIdentity(finalData as Record<string, unknown>)
+		: { _mcp: "figma-console-mcp", data: finalData };
+
 	const content: any[] = [
 		{
 			type: "text",
-			text: JSON.stringify(finalData),
+			text: JSON.stringify(taggedFinal),
 		},
 	];
 
@@ -342,6 +356,10 @@ function adaptiveVerbosity(
  * Generate compact summary of variables data (~2K tokens)
  * Returns high-level overview with counts and names
  */
+/** Present-and-defined — `0`, `false` and `""` are real variable values, not "missing" */
+const hasModeValue = (valuesByMode: any, modeId: string | null | undefined): boolean =>
+	!!valuesByMode && !!modeId && Object.prototype.hasOwnProperty.call(valuesByMode, modeId) && valuesByMode[modeId] !== undefined;
+
 function generateSummary(data: any): any {
 	const summary = {
 		fileKey: data.fileKey,
@@ -354,12 +372,29 @@ function generateSummary(data: any): any {
 		collections: data.variableCollections?.map((c: any) => ({
 			id: c.id,
 			name: c.name,
-			modes: c.modes?.map((m: any) => ({ id: m.modeId, name: m.name })),
+			modes: c.modes?.map((m: any) => ({ id: m.modeId, name: m.name, ...(m.parentModeId ? { parentModeId: m.parentModeId } : {}) })),
 			variable_count: c.variableIds?.length || 0,
+			...(c.isExtension
+				? (() => {
+					const counts = countOverrides(c);
+					const parent = data.variableCollections?.find((p: any) => p.id === c.parentVariableCollectionId);
+					return {
+						isExtension: true,
+						extends: parent ? parent.name : c.parentVariableCollectionId,
+						parentVariableCollectionId: c.parentVariableCollectionId,
+						overridden_variables: counts.variables,
+						overridden_values: counts.values,
+						hint: `Filter with collection="${c.name}" to see every variable's value in this collection, marked overridden or inherited.`,
+					};
+				})()
+				: {}),
 		})) || [],
 		variables_by_type: {} as Record<string, number>,
 		variable_names: [] as string[],
+		...(data.extendedCollectionsWarning ? { warnings: [data.extendedCollectionsWarning] } : {}),
 	};
+	const extendedCount = (data.variableCollections ?? []).filter((c: any) => c.isExtension).length;
+	if (extendedCount > 0) (summary.overview as any).extended_collections = extendedCount;
 
 	// Count variables by type
 	const typeCount: Record<string, number> = {};
@@ -403,6 +438,13 @@ function applyFilters(
 		filteredVariables = filteredVariables.filter((v: any) =>
 			collectionIds.has(v.variableCollectionId)
 		);
+		// An extended collection owns no variables of its own (they keep their
+		// parent's variableCollectionId) — so the filter above finds nothing for it.
+		// Add its variables AS THEY APPEAR IN IT: values per extended mode, each
+		// override or inheritance resolved through the chain.
+		for (const c of filteredCollections) {
+			if (c.isExtension) filteredVariables.push(...extendedCollectionView(data, c));
+		}
 	}
 
 	// Filter by variable name pattern (regex or substring)
@@ -450,11 +492,11 @@ function applyFilters(
 			// Check if variable has values for the specified mode
 			if (v.valuesByMode) {
 				// Try to match by mode ID directly
-				if (v.valuesByMode[filters.mode!]) {
+				if (hasModeValue(v.valuesByMode, filters.mode)) {
 					return true;
 				}
 				// Try using resolved targetModeId
-				if (targetModeId && v.valuesByMode[targetModeId]) {
+				if (hasModeValue(v.valuesByMode, targetModeId)) {
 					return true;
 				}
 				// Try to match by mode name through collections
@@ -465,7 +507,7 @@ function applyFilters(
 					const mode = collection.modes.find((m: any) =>
 						m.name?.toLowerCase().includes(filters.mode!.toLowerCase()) || m.modeId === filters.mode
 					);
-					return mode && v.valuesByMode[mode.modeId];
+					return !!mode && hasModeValue(v.valuesByMode, mode.modeId);
 				}
 			}
 			return false;
@@ -535,6 +577,9 @@ function applyFilters(
 				variableCollectionId: v.variableCollectionId,
 				...(v.modeNames && { modeNames: v.modeNames }),
 				...(v.modeCount && { modeCount: v.modeCount }),
+				...(v.definedInCollectionId && { definedInCollectionId: v.definedInCollectionId }),
+				...(v.overriddenModeIds && { overriddenModeIds: v.overriddenModeIds }),
+				...(v.extendedCollectionOverrides && { extendedCollectionOverrides: v.extendedCollectionOverrides }),
 			}));
 		} else if (verbosity === "standard") {
 			filteredVariables = filteredVariables.map((v: any) => ({
@@ -547,6 +592,9 @@ function applyFilters(
 				...(v.scopes && { scopes: v.scopes }),
 				...(v.selectedMode && { selectedMode: v.selectedMode }),
 				...(v.modeMetadata && { modeMetadata: v.modeMetadata }),
+				...(v.definedInCollectionId && { definedInCollectionId: v.definedInCollectionId }),
+				...(v.overriddenModeIds && { overriddenModeIds: v.overriddenModeIds }),
+				...(v.extendedCollectionOverrides && { extendedCollectionOverrides: v.extendedCollectionOverrides }),
 			}));
 		}
 		// For "full" verbosity, return all fields (no filtering)
@@ -785,14 +833,29 @@ export function registerFigmaAPITools(
 	server: McpServer,
 	getFigmaAPI: () => Promise<FigmaAPI>,
 	getCurrentUrl: () => string | null,
-	getConsoleMonitor?: () => ConsoleMonitor | null,
-	getBrowserManager?: () => any,
-	ensureInitialized?: () => Promise<void>,
 	variablesCache?: Map<string, { data: any; timestamp: number }>,
 	options?: FigmaAPIToolsOptions,
 	getDesktopConnector?: () => Promise<any>,
 ) {
 	const isRemoteMode = options?.isRemoteMode ?? false;
+
+	/**
+	 * Build a designer-readable REST-auth error tagged with our MCP identity.
+	 * Shows only the remediation path that applies to the caller's mode — local
+	 * users never see OAuth instructions, cloud users never see env-var
+	 * instructions. Identity prefix lets LLMs disambiguate this error from
+	 * errors thrown by other Figma-related MCP servers running in parallel.
+	 */
+	function restAuthError(context: string, originalError: string, extra?: string): Error {
+		const remediation = isRemoteMode
+			? "Re-authenticate via the OAuth flow in your MCP client, or pass a Figma personal access token (figd_...) as a Bearer token."
+			: "Set FIGMA_ACCESS_TOKEN in your MCP client config to a Figma personal access token. Generate one at https://www.figma.com/developers/api#access-tokens.";
+
+		return identifiedError(
+			`${context}\nError: ${originalError}\n\nTo fix: ${remediation}${extra ? `\n\n${extra}` : ""}`,
+		);
+	}
+
 	// Tool 8: Get File Data (General Purpose)
 	// NOTE: For specific use cases, consider using specialized tools:
 	// - figma_get_component_for_development: For UI component implementation
@@ -843,14 +906,10 @@ export function registerFigmaAPITools(
 					api = await getFigmaAPI();
 				} catch (apiError) {
 					const errorMessage = apiError instanceof Error ? apiError.message : String(apiError);
-					throw new Error(
-						`Cannot retrieve file data. REST API authentication required.\n` +
-						`Error: ${errorMessage}\n\n` +
-						`To fix:\n` +
-						`1. Local mode: Set FIGMA_ACCESS_TOKEN environment variable\n` +
-						`2. Cloud mode: Authenticate via OAuth\n\n` +
-						`Note: figma_get_file_data requires REST API access. ` +
-						`For component-specific data, use figma_get_component which has Desktop Bridge fallback.`
+					throw restAuthError(
+						"Cannot retrieve file data. REST API authentication required.",
+						errorMessage,
+						"Note: figma_get_file_data requires REST API access. For component-specific data, use figma_get_component which has Desktop Bridge fallback.",
 					);
 				}
 
@@ -869,10 +928,15 @@ export function registerFigmaAPITools(
 
 				logger.info({ fileKey, depth, nodeIds, enrich, verbosity }, "Fetching file data");
 
-				const fileData = await api.getFile(fileKey, {
-					depth,
-					ids: nodeIds,
-				});
+				const wantsNodes = Array.isArray(nodeIds) && nodeIds.length > 0;
+				// With nodeIds, the document is just the page list (depth 1): the file
+				// endpoint counts depth from the document root, so passing ids + depth
+				// there cut the requested nodes off entirely. The nodes themselves come
+				// from the nodes endpoint, where depth counts from each node.
+				const fileData = await api.getFile(fileKey, wantsNodes ? { depth: 1 } : { depth });
+				const nodesData = wantsNodes
+					? await api.getNodes(fileKey, nodeIds, depth ? { depth } : undefined)
+					: null;
 
 				// Apply verbosity filtering to reduce payload size
 				const filterNode = (node: any, level: "summary" | "standard" | "full"): any => {
@@ -903,6 +967,17 @@ export function registerFigmaAPITools(
 						// Include bounds for layout calculations
 						if (node.absoluteBoundingBox) filtered.absoluteBoundingBox = node.absoluteBoundingBox;
 						if (node.size) filtered.size = node.size;
+
+						// Auto-layout and sizing (fixed/hug/fill, min/max constraints)
+						for (const k of [
+							"layoutMode", "layoutSizingHorizontal", "layoutSizingVertical",
+							"primaryAxisSizingMode", "counterAxisSizingMode", "layoutWrap",
+							"primaryAxisAlignItems", "counterAxisAlignItems", "counterAxisSpacing", "layoutPositioning",
+							"minWidth", "maxWidth", "minHeight", "maxHeight",
+							"paddingLeft", "paddingRight", "paddingTop", "paddingBottom", "itemSpacing",
+						]) {
+							if (node[k] !== undefined && node[k] !== null) filtered[k] = node[k];
+						}
 
 						// Include component/instance info for plugin work
 						if (node.componentId) filtered.componentId = node.componentId;
@@ -937,6 +1012,20 @@ export function registerFigmaAPITools(
 					? filterNode(fileData.document, verbosity || "standard")
 					: fileData.document;
 
+				// Requested nodes, filtered at the same verbosity. A node the API
+				// can't find comes back as null rather than silently disappearing.
+				const filterNodes = (level: "summary" | "standard" | "full") => {
+					if (!nodesData?.nodes) return undefined;
+					const out: Record<string, any> = {};
+					// Iterate the REQUESTED ids (normalized, de-duplicated): getNodes also
+					// keys each node under a dashed alias, which doubled every node.
+					for (const id of [...new Set(nodeIds!.map(normalizeNodeId))]) {
+						const doc = nodesData.nodes[id]?.document;
+						out[id] = doc ? (level === "full" ? doc : filterNode(doc, level)) : null;
+					}
+					return out;
+				};
+
 				let response: any = {
 					fileKey,
 					name: fileData.name,
@@ -950,9 +1039,9 @@ export function registerFigmaAPITools(
 						? Object.keys(fileData.styles).length
 						: 0,
 					verbosity: verbosity || "standard",
-					...(nodeIds && {
+					...(wantsNodes && {
 						requestedNodes: nodeIds,
-						nodes: fileData.nodes,
+						nodes: filterNodes((verbosity || "standard") as "summary" | "standard" | "full"),
 					}),
 				};
 
@@ -978,13 +1067,20 @@ export function registerFigmaAPITools(
 				return adaptiveResponse(finalResponse, {
 					toolName: "figma_get_file_data",
 					compressionCallback: (adjustedLevel: string) => {
-						// Re-apply node filtering with lower verbosity
-						const level = adjustedLevel as "summary" | "standard" | "full";
+						// Re-apply node filtering with lower verbosity. "inventory"
+						// (the emergency tier) isn't a filterNode level — clamp it to
+						// "summary", the strongest filter, instead of letting it fall
+						// through filterNode's default branch which returns the RAW
+						// node (that ballooned "compressed" responses). Always
+						// re-filter, even when the caller asked for verbosity='full' —
+						// an emergency downgrade must never echo the raw document.
+						const level = (
+							adjustedLevel === "standard" ? "standard" : "summary"
+						) as "summary" | "standard";
 						const refiltered = {
 							...finalResponse,
-							document: verbosity !== "full"
-								? filterNode(fileData.document, level)
-								: fileData.document,
+							document: filterNode(fileData.document, level),
+							...(wantsNodes && { nodes: filterNodes(level) }),
 							verbosity: level,
 						};
 						return refiltered;
@@ -1022,20 +1118,19 @@ export function registerFigmaAPITools(
 	/**
 	 * Tool 9: Get Variables (Design Tokens)
 	 *
-	 * WORKFLOW:
-	 * - Primary: Attempts to fetch variables via Figma REST API (requires Enterprise plan)
-	 * - Fallback: On 403 error, provides console-based extraction snippet
+	 * RESOLUTION ORDER (in order, first success wins):
+	 *   1. Cache hit (if fresh and refreshCache=false)
+	 *   2. Desktop Bridge plugin via WebSocket — works on any Figma plan
+	 *   3. REST API — requires Enterprise plan (returns 403 otherwise)
+	 *   4. Styles API — partial fallback for non-Enterprise (styles, not variables)
 	 *
-	 * TWO-CALL PATTERN (when API unavailable):
-	 * 1. First call: Returns snippet + instructions (useConsoleFallback: true, default)
-	 * 2. User runs snippet in Figma plugin console
-	 * 3. Second call: Parses captured data (parseFromConsole: true)
-	 *
-	 * IMPORTANT: Snippet requires Figma Plugin API context, not browser DevTools console.
+	 * The legacy `parseFromConsole` two-call console-snippet workflow was
+	 * removed in the Phase 3 cleanup. Setting parseFromConsole=true now
+	 * throws an identified error pointing the caller at the bridge.
 	 */
 	server.tool(
 		"figma_get_variables",
-		"Extract design tokens and variables from a Figma file with code export support (CSS, Tailwind, TypeScript, Sass). Use when user asks for: design system tokens, variables, color/spacing values, theme data, or code exports. Handles multi-mode variables (Light/Dark themes). NOT for component metadata (use figma_get_component). Supports filtering by collection/mode/name and verbosity control to prevent token exhaustion. Enterprise plan required for Variables API; automatically falls back to Styles API or console-based extraction if unavailable. TIP: For full design system extraction (tokens + components + styles combined), prefer figma_get_design_system_kit instead — it returns everything in one optimized call.",
+		"Extract design tokens and variables from a Figma file with code export support (CSS, Tailwind, TypeScript, Sass). Use when user asks for: design system tokens, variables, color/spacing values, theme data, or code exports. Handles multi-mode variables (Light/Dark themes). NOT for component metadata (use figma_get_component). Returns a compact summary by default — pass format='full' for the complete dataset or format='filtered' with collection/namePattern/mode filters for specific variables. Supports verbosity control to prevent token exhaustion. Resolution order: Desktop Bridge plugin (works on any plan) → Variables REST API (Enterprise only) → Styles API as a partial fallback. TIP: For full design system extraction (tokens + components + styles combined), prefer figma_get_design_system_kit instead — it returns everything in one optimized call.",
 		{
 			fileUrl: z
 				.string()
@@ -1081,10 +1176,10 @@ export function registerFigmaAPITools(
 			format: z
 				.enum(["summary", "filtered", "full"])
 				.optional()
-				.default("full")
 				.describe(
 					"Response format: 'summary' (~2K tokens with overview and names only), 'filtered' (apply collection/name/mode filters), 'full' (complete dataset from cache or fetch). " +
-					"Summary is recommended for initial exploration. Full format returns all data but may be auto-summarized if >25K tokens. Default: full"
+					"Default: summary (token-efficient). When format is omitted, filter params (collection/namePattern/mode) auto-select 'filtered', and enrichment/export/resolveAliases/returnAsLinks params auto-select 'full'. " +
+					"Full format returns all data but may be auto-summarized if >25K tokens."
 				),
 			collection: z
 				.string()
@@ -1102,7 +1197,7 @@ export function registerFigmaAPITools(
 				.boolean()
 				.optional()
 				.default(false)
-				.describe("Return variables as resource_link references instead of full data. Drastically reduces payload size (100+ variables = ~20KB vs >1MB). Use with figma_get_variable_by_id to fetch specific variables. Recommended for large variable sets. Default: false"),
+				.describe("Return variables as resource_link references instead of full data. Drastically reduces payload size (100+ variables = ~20KB vs >1MB). Recommended for large variable sets — combine with format='filtered' + namePattern/collection/mode to fetch only the variables you need. Default: false"),
 			refreshCache: z
 				.boolean()
 				.optional()
@@ -1113,22 +1208,14 @@ export function registerFigmaAPITools(
 				.optional()
 				.default(true)
 				.describe(
-					"Enable automatic fallback to console-based extraction when REST API returns 403 (Figma Enterprise plan required). " +
-					"When enabled, provides a JavaScript snippet that users run in Figma's plugin console. " +
-					"This is STEP 1 of a two-call workflow. After receiving the snippet, instruct the user to run it, then call this tool again with parseFromConsole=true. " +
-					"Default: true. Set to false only to disable the fallback entirely."
+					"DEPRECATED — has no effect. The console-snippet workflow was removed in the Phase 3 CDP cleanup; the Desktop Bridge plugin now handles all non-REST variable extraction automatically. Kept for parameter compatibility only — safe to ignore."
 				),
 			parseFromConsole: z
 				.boolean()
 				.optional()
 				.default(false)
 				.describe(
-					"Parse variables from console logs after user has executed the snippet. " +
-					"This is STEP 2 of the two-call workflow. Set to true ONLY after: " +
-					"(1) you received a console snippet from the first call, " +
-					"(2) instructed the user to run it in Figma's PLUGIN console (Plugins → Development → Open Console or existing plugin), " +
-					"(3) user confirmed they ran the snippet and saw '✅ Variables data captured!' message. " +
-					"Default: false. Never set to true on the first call."
+					"DEPRECATED — setting this to true now raises an explicit error. The Puppeteer-based console parser no longer exists. Open the Figma Console MCP Desktop Bridge plugin in Figma Desktop and call figma_get_variables() without parseFromConsole; the plugin returns full variable data through the WebSocket bridge."
 				),
 			page: z
 				.number()
@@ -1177,6 +1264,29 @@ export function registerFigmaAPITools(
 			pageSize,
 			resolveAliases
 		}) => {
+			// Smart format default (token efficiency): when the caller doesn't pick a
+			// format, use the cheapest one their other parameters allow. Explicit
+			// format callers are unaffected. Only parameters without schema defaults
+			// (or defaulting to false) can signal intent — verbosity, includePublished,
+			// and page/pageSize are always populated by their defaults.
+			if (!format) {
+				if (collection || namePattern || mode) {
+					format = "filtered";
+				} else if (
+					enrich ||
+					include_usage ||
+					include_dependencies ||
+					include_exports ||
+					(export_formats && export_formats.length > 0) ||
+					resolveAliases ||
+					returnAsLinks
+				) {
+					format = "full";
+				} else {
+					format = "summary";
+				}
+			}
+
 			// Extract fileKey and optional branchId outside try block so they're available in catch block
 			const url = fileUrl || getCurrentUrl();
 			if (!url) {
@@ -1565,14 +1675,7 @@ export function registerFigmaAPITools(
 				// Check if REST API token is available
 				const hasToken = !!process.env.FIGMA_ACCESS_TOKEN;
 				let restApiSucceeded = false;
-
-				// Detect Desktop Bridge availability early (needed for priority decision)
-				if (ensureInitialized && !getDesktopConnector && !parseFromConsole) {
-					logger.info("Calling ensureInitialized to initialize browser manager (legacy path)");
-					await ensureInitialized();
-				}
-				const browserManager = getBrowserManager?.();
-				const hasDesktopConnection = !!getDesktopConnector || !!browserManager;
+				const hasDesktopConnection = !!getDesktopConnector;
 
 				// PRIORITY LOGIC:
 				// 1. If Desktop Bridge connected → Try Desktop Bridge FIRST (instant, all plans, full Plugin API data)
@@ -1603,6 +1706,62 @@ export function registerFigmaAPITools(
 						let publishedFormatted = includePublished
 							? formatVariables(published)
 							: null;
+
+						// Cache the FULL dataset in the Desktop-connection shape BEFORE
+						// any format/verbosity/pagination mutation. The cache reader
+						// expects { variables, variableCollections }; caching the
+						// stripped, paginated page (the old behavior) poisoned every
+						// follow-up filtered/summary call for the whole TTL window.
+						// Variable objects are shallow-copied so downstream verbosity
+						// stripping can't reach into the cached entries.
+						if (variablesCache) {
+							evictOldestCacheEntry(variablesCache);
+							variablesCache.set(fileKey, {
+								data: {
+									fileKey,
+									source: "rest_api",
+									timestamp: Date.now(),
+									variables: (localFormatted.variables || []).map(
+										(v: any) => ({ ...v }),
+									),
+									variableCollections: (localFormatted.collections || []).map(
+										(c: any) => ({ ...c }),
+									),
+								},
+								timestamp: Date.now(),
+							});
+							logger.info(
+								{ fileKey, variableCount: localFormatted.variables?.length },
+								"Cached full REST API variables dataset",
+							);
+						}
+
+						// Honor format='summary' on the REST path (historically only the
+						// cache and Desktop Bridge paths summarized). Runs AFTER the
+						// cache write so summary calls still populate the full dataset.
+						if (format === 'summary') {
+							const summary = generateSummary({
+								fileKey,
+								timestamp: Date.now(),
+								source: 'rest_api',
+								variables: localFormatted.variables,
+								variableCollections: localFormatted.collections,
+							});
+							logger.info({ fileKey, estimatedTokens: estimateTokens(summary) }, 'Generated summary from REST API data');
+							return {
+								content: [
+									{
+										type: "text",
+										text: JSON.stringify({
+											fileKey,
+											source: "rest_api",
+											format: "summary",
+											data: summary,
+										}),
+									},
+								],
+							};
+						}
 
 						// DEBUG: Check if valuesByMode exists before filtering
 						if (localFormatted.variables[0]) {
@@ -1716,32 +1875,8 @@ export function registerFigmaAPITools(
 						}
 
 
-						// Cache the successful REST API response
-						const dataForCache = {
-							fileKey,
-							local: {
-								summary: localFormatted.summary,
-								collections: localFormatted.collections,
-								variables: localFormatted.variables,
-							},
-							...(includePublished &&
-								publishedFormatted && {
-									published: {
-										summary: publishedFormatted.summary,
-										collections: publishedFormatted.collections,
-										variables: publishedFormatted.variables,
-									},
-								}),
-							verbosity: verbosity || "standard",
-							enriched: enrich || false,
-							timestamp: Date.now(),
-							source: "rest_api",
-						};
-
-						if (variablesCache) {
-							variablesCache.set(fileKey, { data: dataForCache, timestamp: Date.now() });
-							logger.info({ fileKey }, "Cached REST API variables");
-						}
+						// (Cache write happens above, pre-mutation — the response below
+						// is built from the filtered/paginated working copies.)
 
 						// Apply alias resolution if requested (REST API format has local.variables)
 						if (resolveAliases && localFormatted.variables?.length > 0) {
@@ -1793,7 +1928,7 @@ export function registerFigmaAPITools(
 							const content: any[] = [
 								{
 									type: "text",
-									text: `Variables for file ${fileKey} (${localFormatted.variables.length} variables). Use figma_get_variable_by_id to fetch specific variables:\n\n`,
+									text: `Variables for file ${fileKey} (${localFormatted.variables.length} variables). Call figma_get_variables again with format='filtered' and a namePattern/collection/mode filter to fetch specific variables:\n\n`,
 								},
 							];
 
@@ -1901,29 +2036,40 @@ export function registerFigmaAPITools(
 
 				// PRIMARY: Try Desktop Bridge (instant, all plans, full Plugin API data including aliases)
 				// Also used as fallback when REST API fails (403, timeout, rate limit)
-				if (hasDesktopConnection && !parseFromConsole && !restApiSucceeded) {
+				if (hasDesktopConnection && !parseFromConsole && !restApiSucceeded && getDesktopConnector) {
 					try {
 						logger.info({ fileKey }, "Attempting to get variables via Desktop connection");
 
-						let connector: any;
-						if (getDesktopConnector) {
-							connector = await getDesktopConnector();
-						} else {
-							// Fallback: direct connector (legacy path)
-							const { FigmaDesktopConnector } = await import('./figma-desktop-connector.js');
-							const page = await browserManager.getPage();
-							connector = new FigmaDesktopConnector(page);
-							await connector.initialize();
-						}
-						logger.info({ transport: connector.getTransportType?.() || 'unknown' }, "Desktop connector ready");
+						const connector = await getDesktopConnector();
+						logger.info({ transport: connector.getTransportType?.() || 'websocket' }, "Desktop connector ready");
 
-						const desktopResult = await connector.getVariablesFromPluginUI(fileKey);
+						// When refreshCache is requested, bypass the plugin UI's stale snapshot
+						// and fetch live data directly from the Figma Plugin API
+						const desktopResult = refreshCache
+							? await connector.getVariables(fileKey)
+							: await connector.getVariablesFromPluginUI(fileKey);
 
-						if (desktopResult.success && desktopResult.variables) {
+						// EXECUTE_CODE responses come back wrapped one level deeper:
+						// `{ success: true, result: { success: true, variables, ... } }`
+						// because handleResult in ui.html nests the script return value
+						// under `result`. The plugin-UI cache path (GET_VARIABLES_DATA) does
+						// not nest. Unwrap when we detect the EXECUTE_CODE shape so both
+						// paths produce a uniform { success, variables, ... } below. See #68.
+						const variableData =
+							desktopResult?.result?.variables
+								? desktopResult.result
+								: desktopResult;
+
+						if (variableData?.success && variableData?.variables) {
+							// Extended collections keep their overrides on the collection, not
+							// on the variables — without this every tool reports "no override".
+							const extended = await augmentWithExtendedCollections(connector, variableData, fileKey);
+							if (extended.warning) variableData.extendedCollectionsWarning = extended.warning;
 							logger.info(
 								{
-									variableCount: desktopResult.variables.length,
-									collectionCount: desktopResult.variableCollections?.length
+									variableCount: variableData.variables.length,
+									collectionCount: variableData.variableCollections?.length,
+									extendedCollections: extended.merged,
 								},
 								"Successfully retrieved variables via Desktop connection!"
 							);
@@ -1932,9 +2078,10 @@ export function registerFigmaAPITools(
 							const dataForCache = {
 								fileKey,
 								source: "desktop_connection",
-								timestamp: desktopResult.timestamp || Date.now(),
-								variables: desktopResult.variables,
-								variableCollections: desktopResult.variableCollections,
+								timestamp: variableData.timestamp || Date.now(),
+								variables: variableData.variables,
+								variableCollections: variableData.variableCollections,
+								...(variableData.extendedCollectionsWarning ? { extendedCollectionsWarning: variableData.extendedCollectionsWarning } : {}),
 							};
 
 							// Store in cache with LRU eviction
@@ -2009,6 +2156,9 @@ export function registerFigmaAPITools(
 											resolvedType: v.resolvedType,
 											valuesByMode: v.valuesByMode,
 											variableCollectionId: v.variableCollectionId,
+											...(v.definedInCollectionId && { definedInCollectionId: v.definedInCollectionId }),
+											...(v.overriddenModeIds && { overriddenModeIds: v.overriddenModeIds }),
+											...(v.extendedCollectionOverrides && { extendedCollectionOverrides: v.extendedCollectionOverrides }),
 										};
 									}
 									return v; // standard/full
@@ -2138,7 +2288,7 @@ export function registerFigmaAPITools(
 												format: format || 'full',
 												timestamp: dataForCache.timestamp,
 												data: responseData,
-												cached: true,
+												cached: false,
 											}
 										),
 									},
@@ -2154,21 +2304,6 @@ export function registerFigmaAPITools(
 							message: errorMessage,
 							stack: errorStack
 						}, "Desktop connection failed, falling back to other methods");
-
-						// Try to log to browser console if we have access to page
-						try {
-							if (browserManager) {
-								const page = await browserManager.getPage();
-								await page.evaluate((msg: string, stack: string | undefined) => {
-									console.error('[FIGMA_TOOLS] ❌ Desktop connection failed:', msg);
-									if (stack) {
-										console.error('[FIGMA_TOOLS] Stack trace:', stack);
-									}
-								}, errorMessage, errorStack);
-							}
-						} catch (logError) {
-							// Ignore logging errors
-						}
 
 						// Continue to try REST API fallback
 					}
@@ -2190,6 +2325,48 @@ export function registerFigmaAPITools(
 							let localFormatted = formatVariables(local);
 							let publishedFormatted = includePublished ? formatVariables(published) : null;
 
+							// Cache the FULL dataset pre-mutation in the Desktop shape
+							// (same poisoning fix as the primary REST path above).
+							if (variablesCache) {
+								evictOldestCacheEntry(variablesCache);
+								variablesCache.set(fileKey, {
+									data: {
+										fileKey,
+										source: "rest_api",
+										timestamp: Date.now(),
+										variables: (localFormatted.variables || []).map((v: any) => ({ ...v })),
+										variableCollections: (localFormatted.collections || []).map((c: any) => ({ ...c })),
+									},
+									timestamp: Date.now(),
+								});
+							}
+
+							// Honor format='summary' on the REST fallback path too
+							// (after the cache write, so the full dataset is retained).
+							if (format === 'summary') {
+								const summary = generateSummary({
+									fileKey,
+									timestamp: Date.now(),
+									source: 'rest_api',
+									variables: localFormatted.variables,
+									variableCollections: localFormatted.collections,
+								});
+								logger.info({ fileKey, estimatedTokens: estimateTokens(summary) }, 'Generated summary from REST API fallback data');
+								return {
+									content: [
+										{
+											type: "text",
+											text: JSON.stringify({
+												fileKey,
+												source: "rest_api",
+												format: "summary",
+												data: summary,
+											}),
+										},
+									],
+								};
+							}
+
 							// Apply filters
 							if (format === 'filtered') {
 								const filteredLocal = applyFilters(
@@ -2208,20 +2385,6 @@ export function registerFigmaAPITools(
 									verbosity
 								);
 								localFormatted = { ...localFormatted, collections: verbosityFiltered.variableCollections, variables: verbosityFiltered.variables };
-							}
-
-							// Cache
-							const dataForCache = {
-								fileKey,
-								local: { summary: localFormatted.summary, collections: localFormatted.collections, variables: localFormatted.variables },
-								...(includePublished && publishedFormatted && { published: { summary: publishedFormatted.summary, collections: publishedFormatted.collections, variables: publishedFormatted.variables } }),
-								verbosity: verbosity || "standard",
-								enriched: enrich || false,
-								timestamp: Date.now(),
-								source: "rest_api",
-							};
-							if (variablesCache) {
-								variablesCache.set(fileKey, { data: dataForCache, timestamp: Date.now() });
 							}
 
 							// Apply alias resolution
@@ -2259,63 +2422,20 @@ export function registerFigmaAPITools(
 					}
 				}
 
-				// LAST RESORT: Parse from console logs if requested
+				// LAST RESORT: parseFromConsole was a Puppeteer-era workflow that read
+				// the magic-string output of a console snippet from the browser's
+				// console buffer. After the Phase 3 CDP cleanup there is no longer a
+				// Puppeteer-attached console for the snippet's output to land in, so
+				// the flag has become a no-op. Tell the caller what to do instead.
 				if (parseFromConsole) {
-					const consoleMonitor = getConsoleMonitor?.();
-					if (!consoleMonitor) {
-						throw new Error("Console monitoring not available. Make sure browser is connected to Figma.");
-					}
-
-					logger.info({ fileKey }, "Parsing variables from console logs");
-
-					// Get recent logs
-					const logs = consoleMonitor.getLogs({ count: 100, level: "log" });
-					const varLog = snippetInjector.findVariablesLog(logs);
-
-					if (!varLog) {
-						throw new Error(
-							"No variables found in console logs.\n\n" +
-							"Did you run the snippet in Figma's plugin console? Here's the correct workflow:\n\n" +
-							"1. Call figma_get_variables() without parameters (you may have already done this)\n" +
-							"2. Copy the provided snippet\n" +
-							"3. Open Figma Desktop → Plugins → Development → Open Console\n" +
-							"4. Paste and run the snippet in the PLUGIN console (not browser DevTools)\n" +
-							"5. Wait for '✅ Variables data captured!' confirmation\n" +
-							"6. Then call figma_get_variables({ parseFromConsole: true })\n\n" +
-							"Note: The browser console won't work - you need a plugin console for the figma.variables API."
-						);
-					}
-
-					// Parse variables from log
-					const parsedData = snippetInjector.parseVariablesFromLog(varLog);
-
-					if (!parsedData) {
-						throw new Error("Failed to parse variables from console log");
-					}
-
-					return {
-						content: [
-							{
-								type: "text",
-								text: JSON.stringify(
-									{
-										fileKey,
-										source: "console_capture",
-										local: {
-											summary: {
-												total_variables: parsedData.variables.length,
-												total_collections: parsedData.variableCollections.length,
-											},
-											collections: parsedData.variableCollections,
-											variables: parsedData.variables,
-										},
-										timestamp: parsedData.timestamp,
-										enriched: false,
-									}
-								),
-							},
-						],
-					};
+					throw identifiedError(
+						"parseFromConsole is no longer supported.\n\n" +
+						"The console-snippet workflow it relied on required a Puppeteer browser " +
+						"connection to Figma Desktop, which was removed in Phase 3 of the cleanup. " +
+						"To extract variables, open the Figma Console MCP Desktop Bridge plugin in " +
+						"Figma Desktop and call figma_get_variables() without parseFromConsole — " +
+						"the plugin returns full variable data through the WebSocket bridge."
+					);
 				}
 
 				// No more fallback options available
@@ -2326,13 +2446,34 @@ export function registerFigmaAPITools(
 					`✗ Desktop Bridge (failed or not available)\n` +
 					`\nTo fix:\n` +
 					`1. If you have FIGMA_ACCESS_TOKEN: Check your token permissions\n` +
-					`2. Install and run the Figma Desktop Bridge plugin\n` +
-					`3. Alternative: Use parseFromConsole=true with console snippet workflow`
+					`2. Install and run the Figma Desktop Bridge plugin and re-run this tool`
 				);
 			} catch (error) {
 				logger.error({ error }, "Failed to get variables");
 				const errorMessage =
 					error instanceof Error ? error.message : String(error);
+
+				// A 403 here has two very different causes: an expired/invalid token
+				// (isAuthError, set centrally by FigmaAPI.request) or the Variables
+				// API's Enterprise plan gate. Only the latter should be diagnosed as
+				// "requires Enterprise" — telling a user with a dead token to buy
+				// Enterprise is actively wrong.
+				const isTokenError = (error as any)?.isAuthError === true;
+				if (isTokenError) {
+					return {
+						content: [
+							{
+								type: "text",
+								text: JSON.stringify({
+									error: errorMessage,
+									message: "Failed to retrieve Figma variables — REST token is expired or invalid",
+									hint: "Generate a new personal access token at figma.com → Settings → Security → Personal access tokens and update FIGMA_ACCESS_TOKEN. Or open the Desktop Bridge plugin in Figma Desktop — variables work on any plan without a REST token.",
+								}),
+							},
+						],
+						isError: true,
+					};
+				}
 
 				// FIXED: Jump directly to Styles API (fast) instead of full file data (slow)
 				if (errorMessage.includes("403")) {
@@ -2344,12 +2485,9 @@ export function registerFigmaAPITools(
 							api = await getFigmaAPI();
 						} catch (apiError) {
 							const errorMessage = apiError instanceof Error ? apiError.message : String(apiError);
-							throw new Error(
-								`Cannot retrieve variables or styles. REST API authentication required for both.\n` +
-								`Error: ${errorMessage}\n\n` +
-								`To fix:\n` +
-								`1. Local mode: Set FIGMA_ACCESS_TOKEN environment variable\n` +
-								`2. Cloud mode: Authenticate via OAuth`
+							throw restAuthError(
+								"Cannot retrieve variables or styles. REST API authentication required for both.",
+								errorMessage,
 							);
 						}
 						// Use the Styles API directly - much faster than getFile!
@@ -2403,12 +2541,13 @@ export function registerFigmaAPITools(
 												"The file structure may not contain extractable styles",
 												"There may be a network or authentication issue"
 											],
-											suggestion: "Please ensure the file is accessible and try again, or check if your token has the necessary permissions.",
+											suggestion: "Please ensure the file is accessible and try again, or check if your token has the necessary permissions. With the Desktop Bridge plugin open in Figma Desktop, variables work on any plan without a REST token.",
 											technical: styleError instanceof Error ? styleError.message : String(styleError)
 										}
 									),
 								},
 							],
+							isError: true,
 						};
 					}
 				}
@@ -2423,8 +2562,8 @@ export function registerFigmaAPITools(
 									error: errorMessage,
 									message: "Failed to retrieve Figma variables",
 									hint: errorMessage.includes("403")
-										? "Variables API requires Enterprise plan. Set useConsoleFallback=true for alternative method."
-										: "Make sure FIGMA_ACCESS_TOKEN is configured and has appropriate permissions",
+										? "The Variables REST API requires an Enterprise plan. Open the Desktop Bridge plugin in Figma Desktop instead — variables work on any plan through the bridge."
+										: "Make sure FIGMA_ACCESS_TOKEN is configured and has appropriate permissions, or open the Desktop Bridge plugin in Figma Desktop",
 								}
 							),
 						},
@@ -2484,27 +2623,19 @@ export function registerFigmaAPITools(
 				logger.info({ fileKey, nodeId, format, enrich }, "Fetching component data");
 
 				// PRIORITY 1: Try Desktop Bridge plugin UI first (has reliable description field!)
-				if (getDesktopConnector || (getBrowserManager && ensureInitialized)) {
+				// Metadata only. The plugin's GET_COMPONENT result carries no geometry or
+				// layout, so building a reconstruction spec from it produced 50x50
+				// placeholder nodes with no auto-layout or min/max sizing. Reconstruction
+				// always uses the REST node tree below.
+				if (getDesktopConnector && format !== "reconstruction") {
 					try {
 						logger.info({ nodeId }, "Attempting to get component via Desktop Bridge plugin UI");
 
-						let connector: any;
-						if (getDesktopConnector) {
-							connector = await getDesktopConnector();
-						} else {
-							// Fallback: direct connector (legacy path)
-							if (ensureInitialized) await ensureInitialized();
-							const browserManager = getBrowserManager?.();
-							if (!browserManager) {
-								throw new Error("Browser manager not available after initialization");
-							}
-							const { FigmaDesktopConnector } = await import('./figma-desktop-connector.js');
-							const page = await browserManager.getPage();
-							connector = new FigmaDesktopConnector(page);
-							await connector.initialize();
-						}
+						const connector = await getDesktopConnector();
 
-						const desktopResult = await connector.getComponentFromPluginUI(nodeId);
+						// fileKey: node ids are file-local — without it the ACTIVE file answers,
+						// and may return a different component that shares this id.
+						const desktopResult = await connector.getComponentFromPluginUI(nodeId, fileKey);
 
 						if (desktopResult.success && desktopResult.component) {
 							logger.info(
@@ -2516,53 +2647,6 @@ export function registerFigmaAPITools(
 								},
 								"Successfully retrieved component via Desktop Bridge plugin UI!"
 							);
-
-							// Handle reconstruction format
-							if (format === "reconstruction") {
-								const reconstructionSpec = extractNodeSpec(desktopResult.component);
-								const validation = validateReconstructionSpec(reconstructionSpec);
-
-								if (!validation.valid) {
-									logger.warn({ errors: validation.errors }, "Reconstruction spec validation warnings");
-								}
-
-								// Check if this is a COMPONENT_SET - plugin cannot create these
-								if (reconstructionSpec.type === 'COMPONENT_SET') {
-									const variants = listVariants(desktopResult.component);
-
-									return {
-										content: [
-											{
-												type: "text",
-												text: JSON.stringify({
-													error: "COMPONENT_SET_NOT_SUPPORTED",
-													message: "The Figma Component Reconstructor plugin cannot create COMPONENT_SET nodes (variant containers). Please select a specific variant component instead.",
-													componentName: reconstructionSpec.name,
-													availableVariants: variants,
-													instructions: [
-														"1. In Figma, expand the component set to see individual variants",
-														"2. Select the specific variant you want to reconstruct",
-														"3. Copy the node ID of that variant",
-														"4. Use figma_get_component with that variant's node ID"
-													],
-													note: "COMPONENT_SET is automatically created by Figma when you have variants. The plugin can only create individual COMPONENT nodes."
-												}),
-											},
-										],
-									};
-								}
-
-								// Return spec directly for plugin compatibility
-								// Plugin expects name, type, etc. at root level
-								return {
-									content: [
-										{
-											type: "text",
-											text: JSON.stringify(reconstructionSpec),
-										},
-									],
-								};
-							}
 
 							// Handle metadata format (original behavior)
 							let formatted = desktopResult.component;
@@ -2630,18 +2714,26 @@ export function registerFigmaAPITools(
 					api = await getFigmaAPI();
 				} catch (apiError) {
 					const errorMessage = apiError instanceof Error ? apiError.message : String(apiError);
-					throw new Error(
-						`Cannot retrieve component data. Both Desktop Bridge and REST API are unavailable.\n` +
-						`Desktop Bridge: ${getDesktopConnector || (getBrowserManager && ensureInitialized) ? 'Failed (see logs above)' : 'Not available (local mode only)'}\n` +
-						`REST API: ${errorMessage}\n\n` +
-						`To fix:\n` +
-						`1. Local mode: Set FIGMA_ACCESS_TOKEN environment variable, OR ensure Figma Desktop Bridge plugin is running\n` +
-						`2. Cloud mode: Authenticate via OAuth\n` +
-						`3. Ensure the Desktop Bridge plugin is running in Figma Desktop`
+					if (format === "reconstruction") {
+						throw restAuthError(
+							"Cannot build a reconstruction spec. It reads the node tree (sizes, positions, auto-layout, min/max constraints) from the Figma REST API, which needs a Figma access token.",
+							`REST API: ${errorMessage}`,
+							"The Desktop Bridge plugin can't substitute here: its component lookup returns metadata only. For token-free structured data, use figma_get_component_for_development_deep.",
+						);
+					}
+					const dbStatus = getDesktopConnector
+						? "Failed (see logs above)"
+						: "Not available";
+					throw restAuthError(
+						"Cannot retrieve component data. Both Desktop Bridge and REST API are unavailable.",
+						`Desktop Bridge: ${dbStatus}; REST API: ${errorMessage}`,
+						"Alternatively: open the Figma Desktop Bridge plugin in Figma Desktop to enable the plugin-based fallback.",
 					);
 				}
 
-				const componentData = await api.getComponentData(fileKey, nodeId);
+				// Reconstruction needs the whole tree: at depth 4, deeper layers came
+				// back with no children key and were silently rebuilt as leaves.
+				const componentData = await api.getComponentData(fileKey, nodeId, format === "reconstruction" ? null : 4);
 
 				if (!componentData) {
 					throw new Error(`Component not found: ${nodeId}`);
@@ -2799,12 +2891,9 @@ export function registerFigmaAPITools(
 					api = await getFigmaAPI();
 				} catch (apiError) {
 					const errorMessage = apiError instanceof Error ? apiError.message : String(apiError);
-					throw new Error(
-						`Cannot retrieve styles. REST API authentication required.\n` +
-						`Error: ${errorMessage}\n\n` +
-						`To fix:\n` +
-						`1. Local mode: Set FIGMA_ACCESS_TOKEN environment variable\n` +
-						`2. Cloud mode: Authenticate via OAuth`
+					throw restAuthError(
+						"Cannot retrieve styles. REST API authentication required.",
+						errorMessage,
 					);
 				}
 
@@ -2898,14 +2987,17 @@ export function registerFigmaAPITools(
 				return adaptiveResponse(finalResponse, {
 					toolName: "figma_get_styles",
 					compressionCallback: (adjustedLevel: string) => {
-						// Re-apply style filtering with lower verbosity
-						const level = adjustedLevel as "summary" | "standard" | "full";
-						const refilteredStyles = verbosity !== "full"
-							? styles.map((style: any) => filterStyle(style, level))
-							: styles;
+						// Re-apply style filtering with lower verbosity. Clamp the
+						// emergency "inventory" tier to "summary" (filterStyle has no
+						// inventory branch) and always re-filter — even for
+						// verbosity='full' callers — so compression can never echo
+						// the unfiltered payload.
+						const level = (
+							adjustedLevel === "standard" ? "standard" : "summary"
+						) as "summary" | "standard";
 						return {
 							...finalResponse,
-							styles: refilteredStyles,
+							styles: styles.map((style: any) => filterStyle(style, level)),
 							verbosity: level,
 						};
 					},
@@ -2967,19 +3059,18 @@ export function registerFigmaAPITools(
 		},
 		async ({ fileUrl, nodeId, scale, format }) => {
 			try {
+				// Accept URL-format ids (123-456); the REST response maps key by
+				// colon format (123:456).
+				nodeId = nodeId.replace(/-/g, ":");
 				let api;
 				try {
 					api = await getFigmaAPI();
 				} catch (apiError) {
 					const errorMessage = apiError instanceof Error ? apiError.message : String(apiError);
-					throw new Error(
-						`Cannot render component image. REST API authentication required.\n` +
-						`Error: ${errorMessage}\n\n` +
-						`To fix:\n` +
-						`1. Local mode: Set FIGMA_ACCESS_TOKEN environment variable\n` +
-						`2. Cloud mode: Authenticate via OAuth\n\n` +
-						`Note: For component screenshots, figma_capture_screenshot may work as an alternative ` +
-						`if the Desktop Bridge plugin is connected.`
+					throw restAuthError(
+						"Cannot render component image. REST API authentication required.",
+						errorMessage,
+						"Note: For component screenshots, figma_capture_screenshot may work as an alternative if the Desktop Bridge plugin is connected.",
 					);
 				}
 
@@ -3094,7 +3185,7 @@ export function registerFigmaAPITools(
 	// Tool 13: Get Component for Development (UI Implementation)
 	server.tool(
 		"figma_get_component_for_development",
-		"Get component data optimized for high-fidelity UI implementation. Returns a deep component tree (depth 4) with design tokens (boundVariables), interaction states (reactions), sizing constraints (min/max/layoutSizing), text behavior (autoResize, truncation), and design annotations. Automatically includes 2x rendered image. Use when user asks to: 'build this component', 'implement this in React/Vue', 'generate code for', or needs both visual reference and technical specs for production-quality, accessible, token-aware code. For just metadata/descriptions, use figma_get_component. For just image, use figma_get_component_image. For full annotation details, use figma_get_annotations. To resolve variable IDs to names/values, use figma_get_variables.",
+		"Get component data optimized for high-fidelity UI implementation. Returns a deep component tree (depth 4) with design tokens (boundVariables), interaction states (reactions), sizing constraints (min/max/layoutSizing), text behavior (autoResize, truncation), Figma slots (named freeform-content regions on a component, with the components each accepts and any min/max limit violations), and design annotations. Automatically includes 2x rendered image. Use when user asks to: 'build this component', 'implement this in React/Vue', 'generate code for', or needs both visual reference and technical specs for production-quality, accessible, token-aware code. For just metadata/descriptions, use figma_get_component. For just image, use figma_get_component_image. For full annotation details, use figma_get_annotations. To resolve variable IDs to names/values, use figma_get_variables.",
 		{
 			fileUrl: z
 				.string()
@@ -3123,14 +3214,10 @@ export function registerFigmaAPITools(
 					api = await getFigmaAPI();
 				} catch (apiError) {
 					const errorMessage = apiError instanceof Error ? apiError.message : String(apiError);
-					throw new Error(
-						`Cannot retrieve component for development. REST API authentication required.\n` +
-						`Error: ${errorMessage}\n\n` +
-						`To fix:\n` +
-						`1. Local mode: Set FIGMA_ACCESS_TOKEN environment variable\n` +
-						`2. Cloud mode: Authenticate via OAuth\n\n` +
-						`Note: For component metadata, figma_get_component has Desktop Bridge fallback ` +
-						`that works without token (requires the Desktop Bridge plugin to be connected).`
+					throw restAuthError(
+						"Cannot retrieve component for development. REST API authentication required.",
+						errorMessage,
+						"Note: For component metadata, figma_get_component has a Desktop Bridge fallback that works without a token (requires the Desktop Bridge plugin to be connected)."
 					);
 				}
 
@@ -3290,7 +3377,7 @@ export function registerFigmaAPITools(
 					try {
 						const connector = await getDesktopConnector();
 						// Fetch annotations with child traversal (depth matches REST traversal)
-						const annotResult = await connector.getAnnotations(nodeId, true, 4);
+						const annotResult = await connector.getAnnotations(nodeId, true, 4, fileKey);
 						if (annotResult?.success !== false && annotResult?.data) {
 							const data = annotResult.data;
 							annotations = data.annotations || [];
@@ -3317,7 +3404,7 @@ export function registerFigmaAPITools(
 
 						// Also fetch description from bridge if REST returned empty
 						if (!componentData.description && !componentData.descriptionMarkdown) {
-							const bridgeResult = await connector.getComponentFromPluginUI(nodeId);
+							const bridgeResult = await connector.getComponentFromPluginUI(nodeId, fileKey);
 							if (bridgeResult?.success && bridgeResult.component) {
 								if (bridgeResult.component.descriptionMarkdown) {
 									componentData.descriptionMarkdown = bridgeResult.component.descriptionMarkdown;
@@ -3545,12 +3632,9 @@ export function registerFigmaAPITools(
 					api = await getFigmaAPI();
 				} catch (apiError) {
 					const errorMessage = apiError instanceof Error ? apiError.message : String(apiError);
-					throw new Error(
-						`Cannot retrieve file data for plugin development. REST API authentication required.\n` +
-						`Error: ${errorMessage}\n\n` +
-						`To fix:\n` +
-						`1. Local mode: Set FIGMA_ACCESS_TOKEN environment variable\n` +
-						`2. Cloud mode: Authenticate via OAuth`
+					throw restAuthError(
+						"Cannot retrieve file data for plugin development. REST API authentication required.",
+						errorMessage,
 					);
 				}
 
@@ -3568,10 +3652,15 @@ export function registerFigmaAPITools(
 
 				logger.info({ fileKey, depth, nodeIds }, "Fetching file data for plugin development");
 
-				const fileData = await api.getFile(fileKey, {
-					depth,
-					ids: nodeIds,
-				});
+				const wantsNodes = Array.isArray(nodeIds) && nodeIds.length > 0;
+				// With nodeIds, the document is just the page list (depth 1): the file
+				// endpoint counts depth from the document root, so passing ids + depth
+				// there cut the requested nodes off entirely. The nodes themselves come
+				// from the nodes endpoint, where depth counts from each node.
+				const fileData = await api.getFile(fileKey, wantsNodes ? { depth: 1 } : { depth });
+				const nodesData = wantsNodes
+					? await api.getNodes(fileKey, nodeIds, depth ? { depth } : undefined)
+					: null;
 
 				// Filter to plugin-relevant properties only
 				const filterForPlugin = (node: any): any => {
@@ -3639,9 +3728,14 @@ export function registerFigmaAPITools(
 					styles: fileData.styles
 						? Object.keys(fileData.styles).length
 						: 0,
-					...(nodeIds && {
+					...(wantsNodes && {
 						requestedNodes: nodeIds,
-						nodes: fileData.nodes,
+						nodes: Object.fromEntries(
+							[...new Set(nodeIds!.map(normalizeNodeId))].map((id) => {
+								const doc = nodesData?.nodes?.[id]?.document;
+								return [id, doc ? filterForPlugin(doc) : null];
+							}),
+						),
 					}),
 					metadata: {
 						purpose: "plugin_development",
@@ -3721,7 +3815,7 @@ export function registerFigmaAPITools(
 	// Solves race condition where REST API screenshots show stale data after changes
 	server.tool(
 		"figma_capture_screenshot",
-		"Capture a screenshot of a node using the plugin's exportAsync API. IMPORTANT: This tool captures the CURRENT state from the plugin runtime (not cloud state like REST API), making it reliable for validating changes immediately after making them. Use this instead of figma_get_component_image when you need to verify that changes were applied correctly. Requires Desktop Bridge connection (Figma Desktop with plugin running).",
+		"Capture a screenshot of a node using the plugin's exportAsync API. IMPORTANT: This tool captures the CURRENT state from the plugin runtime (not cloud state like REST API), making it reliable for validating changes immediately after making them. Use this instead of figma_get_component_image when you need to verify that changes were applied correctly. Defaults are AI-optimized: PNG at 1x with automatic downscaling so the longest side stays within the 1568px AI vision processing ceiling. PNG is the default because design tool content (flat colors, text, UI components) compresses significantly better as PNG. Use JPG for photographic or gradient-heavy content. Requires Desktop Bridge connection (Figma Desktop with plugin running).",
 		{
 			nodeId: z
 				.string()
@@ -3733,14 +3827,14 @@ export function registerFigmaAPITools(
 				.enum(["PNG", "JPG", "SVG"])
 				.optional()
 				.default("PNG")
-				.describe("Image format (default: PNG)"),
+				.describe("Image format (default: PNG). Use JPG for photographic or gradient-heavy content."),
 			scale: z
 				.number()
 				.min(0.5)
 				.max(4)
 				.optional()
-				.default(2)
-				.describe("Scale factor (default: 2 for 2x resolution)"),
+				.default(1)
+				.describe("Scale factor (default: 1). The plugin automatically caps the effective scale so the exported image does not exceed 1568px on its longest side (the AI vision processing ceiling)."),
 		},
 		async ({ nodeId, format, scale }) => {
 			try {
@@ -3756,40 +3850,6 @@ export function registerFigmaAPITools(
 					// Wrap in expected format only if connector returns raw data without a success flag
 					if (result && typeof result.success === 'undefined' && result.image) {
 						result = { success: true, image: result };
-					}
-				}
-
-				// Legacy CDP fallback (only when no connector factory is available)
-				if (!result && !getDesktopConnector) {
-					const browserManager = getBrowserManager?.();
-					if (!browserManager) {
-						throw new Error(
-							"Desktop Bridge not available. To capture screenshots:\n" +
-							"1. Open your Figma file in Figma Desktop\n" +
-							"2. Install and run the 'Figma Console MCP' plugin\n" +
-							"3. Ensure the plugin shows 'MCP ready' status"
-						);
-					}
-
-					if (ensureInitialized) {
-						await ensureInitialized();
-					}
-
-					const page = await browserManager.getPage();
-					const frames = page.frames();
-
-					for (const frame of frames) {
-						try {
-							const hasFunction = await frame.evaluate('typeof window.captureScreenshot === "function"');
-							if (hasFunction) {
-								result = await frame.evaluate(
-									`window.captureScreenshot(${JSON.stringify(nodeId || '')}, ${JSON.stringify({ format, scale })})`
-								);
-								break;
-							}
-						} catch {
-							continue;
-						}
 					}
 				}
 
@@ -3825,6 +3885,7 @@ export function registerFigmaAPITools(
 								metadata: {
 									source: "plugin_export_async",
 									note: "Screenshot captured successfully. The image is included below for visual analysis. This shows the CURRENT plugin runtime state (guaranteed to reflect recent changes).",
+									formatAdvice: result.image.formatAdvice || undefined,
 								},
 							}),
 						},
@@ -3860,7 +3921,7 @@ export function registerFigmaAPITools(
 	// This is the correct way to update TEXT/BOOLEAN/VARIANT properties on component instances
 	server.tool(
 		"figma_set_instance_properties",
-		"Update component properties on a component instance. IMPORTANT: Use this tool instead of trying to edit text nodes directly when working with component instances. Components often expose TEXT, BOOLEAN, INSTANCE_SWAP, and VARIANT properties that control their content. Direct text node editing may fail silently if the component uses properties. This tool handles the #nodeId suffix pattern automatically. Requires Desktop Bridge connection.",
+		"Update component properties on a component instance. IMPORTANT: Use this tool instead of trying to edit text nodes directly when working with component instances. Components often expose TEXT, BOOLEAN, INSTANCE_SWAP, and VARIANT properties that control their content. SLOT properties CANNOT be set here — use figma_append_to_slot to populate slot content. Direct text node editing may fail silently if the component uses properties. This tool handles the #nodeId suffix pattern automatically. Requires Desktop Bridge connection.",
 		{
 			nodeId: z
 				.string()
@@ -3888,40 +3949,6 @@ export function registerFigmaAPITools(
 					result = await connector.setInstanceProperties(nodeId, properties);
 				}
 
-				// Legacy CDP fallback (only when no connector factory is available)
-				if (!result && !getDesktopConnector) {
-					const browserManager = getBrowserManager?.();
-					if (!browserManager) {
-						throw new Error(
-							"Desktop Bridge not available. To set instance properties:\n" +
-							"1. Open your Figma file in Figma Desktop\n" +
-							"2. Install and run the 'Figma Console MCP' plugin\n" +
-							"3. Ensure the plugin shows 'MCP ready' status"
-						);
-					}
-
-					if (ensureInitialized) {
-						await ensureInitialized();
-					}
-
-					const page = await browserManager.getPage();
-					const frames = page.frames();
-
-					for (const frame of frames) {
-						try {
-							const hasFunction = await frame.evaluate('typeof window.setInstanceProperties === "function"');
-							if (hasFunction) {
-								result = await frame.evaluate(
-									`window.setInstanceProperties(${JSON.stringify(nodeId)}, ${JSON.stringify(properties)})`
-								);
-								break;
-							}
-						} catch {
-							continue;
-						}
-					}
-				}
-
 				if (!result) {
 					throw new Error(
 						"Desktop Bridge plugin not found. Ensure the 'Figma Console MCP' plugin is running in Figma Desktop."
@@ -3939,8 +3966,14 @@ export function registerFigmaAPITools(
 							text: JSON.stringify({
 								success: true,
 								instance: result.instance,
+								// Plugin-side warnings (e.g. property names that didn't
+								// match anything) — without these a partial apply looks
+								// like a full success.
+								warnings: result.warnings?.length ? result.warnings : undefined,
 								metadata: {
-									note: "Instance properties updated successfully. Use figma_capture_screenshot to verify visual changes.",
+									note: result.warnings?.length
+										? "Some properties were applied, but see warnings — not every requested property matched. Use figma_capture_screenshot to verify visual changes."
+										: "Instance properties updated successfully. Use figma_capture_screenshot to verify visual changes.",
 								},
 							}),
 						},

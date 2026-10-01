@@ -1,107 +1,11 @@
 ---
 title: "Use Cases"
-description: "Real-world scenarios for plugin debugging, design system extraction, component implementation, and AI-assisted design creation."
+description: "Real-world scenarios for design system extraction, component implementation, accessibility scanning, and AI-assisted design creation."
 ---
 
 # Use Cases & Scenarios
 
 This guide shows real-world scenarios for using Figma Console MCP in your workflow.
-
-## 🐛 Plugin Development & Debugging
-
-### Scenario 1: Simple Plugin Debugging (Local Mode - Easiest!)
-
-**Your situation:** You're developing a Figma plugin and want to see console output.
-
-**One-time setup:** Connect to Figma Desktop using one of these methods:
-- Install the Desktop Bridge Plugin (Plugins → Development → Import from manifest) and run it in your file
-
-Then open your design file and run your plugin.
-
-**What to say to your AI assistant:**
-
-```
-"Check the last 20 console logs"
-```
-
-Then run your plugin in Figma Desktop, and say:
-
-```
-"Check the last 20 console logs again"
-```
-
-**What happens:**
-1. AI retrieves current console logs (likely empty initially)
-2. You run your plugin in Figma Desktop
-3. AI retrieves logs again - now showing ALL plugin output: `[Main]`, `[Swapper]`, `[Serializer]`, etc.
-4. You see errors, warnings, and log statements with timestamps
-
-**Follow-up prompts:**
-- "Show me just the error logs"
-- "What does this stack trace mean?"
-- "Help me fix this error"
-
-**Why this works:** In local mode, the MCP automatically monitors Figma Desktop. No navigation needed!
-
----
-
-### Scenario 2: Debug Console Errors in Plugin (Cloud Mode)
-
-**Your situation:** You're using cloud mode or need to debug a specific Figma file URL.
-
-**What to say to your AI assistant:**
-
-```
-"Navigate to my Figma file at https://figma.com/design/abc123 and watch console logs for 30 seconds while I test my plugin"
-```
-
-**What happens:**
-1. AI navigates to your Figma file
-2. Starts monitoring console logs in real-time
-3. Captures any errors, warnings, or log statements
-4. Reports back with timestamped logs and stack traces
-
-**Follow-up prompts:**
-- "Show me just the error logs"
-- "What does this stack trace mean?"
-- "Help me fix this error"
-
----
-
-### Scenario 3: Monitor Plugin Performance
-
-**Your situation:** You want to see what your plugin is logging during execution.
-
-**What to say:**
-
-```
-"Navigate to https://figma.com/design/abc123 and watch console for 60 seconds. Show me all console.log statements"
-```
-
-**What happens:**
-1. AI monitors all console output for 60 seconds
-2. Captures every console.log(), console.info(), console.warn()
-3. Shows you a timeline of what your plugin is doing
-
----
-
-### Scenario 4: Debug Plugin with Screenshots
-
-**Your situation:** Plugin UI isn't rendering correctly.
-
-**What to say:**
-
-```
-"Navigate to my plugin file, take a screenshot of the plugin UI, then show me console errors"
-```
-
-**What happens:**
-1. AI navigates to your file
-2. Takes screenshot showing the current state
-3. Retrieves console errors
-4. You can see both visual state and error logs together
-
----
 
 ## 🎨 Design System Extraction
 
@@ -505,7 +409,7 @@ or
 1. AI generates a 6-character pairing code (valid for 5 minutes)
 2. You enter the code in the Desktop Bridge plugin's Cloud Mode section
 3. The plugin connects to the cloud relay — you're paired
-4. All write tools (43 total) are now available through the cloud
+4. All Cloud Mode tools — including write/create tools — are now available through the cloud relay
 
 **Follow-up prompts:**
 - "Create a card component with an image, title, and description"
@@ -700,23 +604,25 @@ or
 
 ## 🔄 Integration with Other Tools
 
-### With Figma Official Dev Mode MCP
+### With Figma's Official MCP Server
+
+Figma's official MCP server provides design context for code generation and Code Connect mappings. Console MCP can check the result against the design and the token set.
 
 **Workflow:**
-1. Use Figma Dev Mode MCP to generate component code
-2. Use Figma Console MCP to get design token values
-3. Replace hardcoded values with tokens
-4. Use Console MCP to debug when integrated
+1. Generate component code with the official server's `get_design_context` (and Code Connect, if your team uses it)
+2. Ask Console MCP for the component's token names and values (`figma_get_component_for_development_deep` or `figma_get_variables`)
+3. Replace any hardcoded values with tokens
+4. Run `figma_check_design_parity` to confirm the implementation matches the Figma component
 
 **Example:**
 ```
-// Step 1: Dev Mode MCP generates
+// Generated code contains a raw value
 <Button className="bg-[#4375ff]">Click me</Button>
 
-// Step 2: Console MCP provides token
+// Console MCP returns the bound token
 --color-primary: #4375FF
 
-// Step 3: You refactor
+// You refactor to the token
 <Button className="bg-primary">Click me</Button>
 ```
 
@@ -725,7 +631,36 @@ or
 ## 📚 More Examples
 
 See also:
-- [Tool Documentation](tools) - Complete API reference for all 90+ tools
+- [Tool Documentation](tools) - Complete API reference for all 121 tools
 - [Architecture Overview](architecture) - Understanding deployment modes
-- [Example Prompts](../README.md#example-prompts) - Quick prompt examples
+- [Example Prompts](https://github.com/southleft/figma-console-mcp#-example-prompts) - Quick prompt examples on GitHub
 - [Troubleshooting](troubleshooting) - Solutions to common issues
+
+---
+
+## 🐛 Plugin Development & Debugging
+
+<Warning>
+**Limited availability.** Console monitoring currently captures logs from the Desktop Bridge plugin sandbox only. Monitoring a separate plugin's console is not supported — Figma allows only one plugin to run at a time, and each plugin has an isolated console. This was possible in earlier versions using Chrome DevTools Protocol (CDP) but is not compatible with the current WebSocket bridge architecture. We're exploring workarounds and will update this section when a solution is available.
+</Warning>
+
+### Scenario: Simple Plugin Debugging
+
+**Your situation:** You're developing a Figma plugin and want to see console output from the Desktop Bridge plugin itself.
+
+**What to say to your AI assistant:**
+
+```
+"Check the last 20 console logs"
+```
+
+**What happens:**
+1. AI retrieves console logs from the Desktop Bridge plugin sandbox
+2. Shows errors, warnings, and log statements with timestamps
+
+**Follow-up prompts:**
+- "Show me just the error logs"
+- "What does this stack trace mean?"
+- "Help me fix this error"
+
+**Note:** These console tools capture output from the Desktop Bridge plugin (code.js), not from other plugins running in Figma. To debug a separate plugin, you would need to use Figma's built-in DevTools (Help → Debugging → Open DevTools) alongside the MCP tools.
