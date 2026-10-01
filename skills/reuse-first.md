@@ -33,12 +33,29 @@ Para cada pieza, en este orden (de más autoritativo a menos):
 3. figma_get_library_components → ¿existe en una librería publicada vinculada?
 4. figma_get_design_system_summary → panorama del DS del archivo para descartar duplicados.
 ```
+Si conoces la key de un componente de librería (registry, `code-connect.map.json`), resuélvelo directo con `figma_get_library_component_by_key`.
+
+**Búsqueda de respaldo (obligatoria si el paso 2 devuelve 0 resultados o error).** Un "0 resultados" puede significar que la búsqueda no corrió, no que el componente no exista (visto en v2: más de 120 s y 0 resultados en un archivo con una página de Buttons). Antes de decidir GENERAR, barre el archivo con `figma_execute` (timeout 30000):
+```js
+await figma.loadAllPagesAsync();
+const comps = figma.root.findAllWithCriteria({ types: ["COMPONENT", "COMPONENT_SET"] })
+  .filter(c => c.type === "COMPONENT_SET" || c.parent?.type !== "COMPONENT_SET");
+const norm = s => s.toLowerCase().replace(/[\s_]+/g, "-").trim();
+const lev = (a, b) => { const d = [...Array(b.length + 1).keys()]; for (let i = 1; i <= a.length; i++) { let p = d[0]; d[0] = i; for (let j = 1; j <= b.length; j++) { const t = d[j]; d[j] = Math.min(d[j] + 1, d[j - 1] + 1, p + (a[i - 1] === b[j - 1] ? 0 : 1)); p = t; } } return d[b.length]; };
+const wanted = PIEZAS; // ["action/button/primary", ...]
+return wanted.map(q => {
+  const exact = comps.find(c => norm(c.name) === norm(q));
+  if (exact) return { q, match: exact.name, nodeId: exact.id, how: "exacto" };
+  const near = comps.map(c => ({ c, d: lev(norm(c.name), norm(q)) })).sort((x, y) => x.d - y.d)[0];
+  return near && near.d <= 2 ? { q, match: near.c.name, nodeId: near.c.id, how: "fuzzy d=" + near.d } : { q, match: null };
+});
+```
+Verificado en vivo: exacto, mayúsculas (`Action/Button/Primary`) y typo (`primaryy`, d=1) reusan; una pieza inexistente cae a GENERAR. Un match **fuzzy** se reporta al usuario antes de reusar.
 Registrar por cada pieza: `{ pieza, encontrada: si|no, fuente: registry|archivo|libreria|ninguna, ref }`.
 
 ### Paso 3 — Decidir reusar vs. generar
 ```
-- encontrada=si  → REUSAR vía figma_execute (NO figma_instantiate_component: se cuelga 15s en
-                    archivos dynamic-page). Todo async:
+- encontrada=si  → REUSAR vía figma_execute con el helper reuseComponent(). Todo async:
                     · local   → await figma.getNodeByIdAsync(nodeId)
                     · librería → await figma.importComponentByKeyAsync(variantKey)
                     → comp.createInstance() → appendChild + x/y → setProperties(variant/overrides).
@@ -48,7 +65,9 @@ Registrar por cada pieza: `{ pieza, encontrada: si|no, fuente: registry|archivo|
 ```
 Si el registry define la pieza pero no hay componente en el archivo, sugerir correr `apply-contract` primero para materializar el stub y reusarlo.
 
-> **⚠️ No uses la tool dedicada `figma_instantiate_component`.** En archivos con `documentAccess: dynamic-page` (el default nuevo del manifest) se cuelga ~15s por instancia y revienta con `INSTANTIATE_COMPONENT timed out after 15000ms`. El control crudo `comp.createInstance()` vía `figma_execute` funciona en ~12ms. Usa el drop-in async `reuseComponent()` (ver `figma-scripts/reuse-component.js` y `docs/fixes/reuse-first-instantiate-fallback.md`).
+> **Sobre `figma_instantiate_component`.** En v2 se colgaba 15 s. La causa real (verificada en vivo en v3) no era dynamic-page: el bridge intentaba primero `importComponentByKeyAsync(componentKey)`, que con un componente **local no publicado** nunca resuelve, y el servidor cortaba antes de llegar al fallback por `nodeId`. El bridge v3 busca primero el `nodeId` local. Aun así, el helper `reuseComponent()` vía `figma_execute` sigue siendo la ruta por defecto: es async de punta a punta y tarda ~90 ms para varias instancias.
+>
+> **Ojo con los timeouts:** una llamada que da timeout **puede crear la instancia después**, en silencio. Si una instanciación falla por timeout, busca y elimina instancias huérfanas antes de reintentar.
 
 **Helper de reúso (drop-in async, seguro en dynamic-page):**
 ```js
