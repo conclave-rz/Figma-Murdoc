@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 560" role="img" aria-labelledby="title desc">
+  <title id="title">Flujo del listado al detalle</title>
+  <desc id="desc">Dos paneles conectados muestran el paso desde un listado de solicitudes hasta la vista de detalle.</desc>
+  <rect width="1200" height="560" fill="#edf1ec"/>
+  <rect x="90" y="88" width="390" height="384" rx="24" fill="#fff" stroke="#cad4cc" stroke-width="3"/>
+  <rect x="720" y="88" width="390" height="384" rx="24" fill="#fff" stroke="#cad4cc" stroke-width="3"/>
+  <text x="125" y="140" fill="#166149" font-family="system-ui, sans-serif" font-size="24" font-weight="700">Listado</text>
+  <text x="755" y="140" fill="#166149" font-family="system-ui, sans-serif" font-size="24" font-weight="700">Detalle</text>
+  <g fill="#e6f1ec"><rect x="125" y="178" width="320" height="62" rx="12"/><rect x="125" y="258" width="320" height="62" rx="12"/><rect x="125" y="338" width="320" height="62" rx="12"/></g>
+  <g fill="#d6dfd8"><rect x="755" y="180" width="150" height="18" rx="9"/><rect x="755" y="220" width="300" height="12" rx="6"/><rect x="755" y="250" width="260" height="12" rx="6"/><rect x="755" y="316" width="300" height="12" rx="6"/><rect x="755" y="346" width="220" height="12" rx="6"/></g>
+  <path d="M520 280h140" fill="none" stroke="#166149" stroke-width="8" stroke-linecap="round"/><path d="m638 250 32 30-32 30" fill="none" stroke="#166149" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+  <text x="600" y="342" text-anchor="middle" fill="#637068" font-family="system-ui, sans-serif" font-size="19">La persona selecciona una solicitud</text>
+</svg>

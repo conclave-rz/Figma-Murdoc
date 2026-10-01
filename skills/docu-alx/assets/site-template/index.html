@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Documentación de Historias de Usuario</title>
+  <link rel="stylesheet" href="styles.css?v=2">
+  <link rel="stylesheet" href="toolkit-theme.css?v=1">
+</head>
+<body>
+  <a class="skip-link" href="#main-content">Saltar al contenido</a>
+  <div class="app-shell">
+    <aside class="sidebar" id="sidebar" aria-label="Historias de Usuario">
+      <div class="brand-block">
+        <div class="product-mark"><span aria-hidden="true"></span> DOCU ALX</div>
+        <p class="eyebrow">Documentación funcional</p>
+        <a class="document-title" id="document-title" href="#inicio"></a>
+        <p class="document-summary" id="document-summary"></p>
+      </div>
+      <label class="search-box">
+        <span class="sr-only">Buscar Historias de Usuario</span>
+        <svg class="search-icon" aria-hidden="true" viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.5"/><path d="m16 16 4 4"/></svg>
+        <input id="search" type="search" placeholder="Buscar HU…" autocomplete="off">
+      </label>
+      <nav id="story-nav" aria-label="Listado de Historias de Usuario"></nav>
+      <p class="empty-nav" id="empty-nav" hidden>No encontramos Historias de Usuario con ese texto.</p>
+      <div class="sidebar-actions">
+        <button class="button secondary" id="download-current" type="button">Descargar esta HU</button>
+        <button class="button" id="download-all" type="button">Descargar todo en Markdown</button>
+      </div>
+    </aside>
+    <main class="main" id="main-content" tabindex="-1">
+      <header class="app-header">
+        <button class="menu-button" id="menu-button" type="button" aria-controls="sidebar" aria-expanded="false">☰ Historias</button>
+        <div class="breadcrumb"><span>Historias de Usuario</span><strong id="mobile-title"></strong></div>
+        <button class="chat-toggle" id="chat-toggle" type="button" aria-controls="chat-panel" aria-expanded="false" aria-label="Abrir consulta de documentación">
+          <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M7 18.4 3.5 21v-5.2A8.5 8.5 0 1 1 7 18.4Z"/><path d="M8 10h8M8 14h5"/></svg>
+          <span>Consultar</span>
+        </button>
+      </header>
+      <div class="reading-column" id="content" aria-live="polite"></div>
+    </main>
+  </div>
+  <div class="chat-scrim" id="chat-scrim" hidden></div>
+  <aside class="chat-panel" id="chat-panel" role="dialog" aria-modal="false" aria-labelledby="chat-title" aria-hidden="true">
+    <header class="chat-header">
+      <div>
+        <p class="eyebrow">Consulta local</p>
+        <h2 id="chat-title">Pregunta sobre las HU</h2>
+      </div>
+      <button class="icon-button" id="chat-close" type="button" aria-label="Cerrar consulta">×</button>
+    </header>
+    <p class="chat-disclaimer">Las respuestas usan solo el contenido registrado en esta documentación.</p>
+    <div class="chat-messages" id="chat-messages" aria-live="polite" aria-label="Conversación"></div>
+    <div class="chat-suggestions" id="chat-suggestions" aria-label="Preguntas sugeridas"></div>
+    <form class="chat-form" id="chat-form">
+      <label class="sr-only" for="chat-input">Escribe una pregunta sobre las Historias de Usuario</label>
+      <input id="chat-input" type="text" placeholder="Ej. ¿Qué está pendiente?" autocomplete="off">
+      <button class="send-button" type="submit" aria-label="Enviar pregunta">↑</button>
+    </form>
+  </aside>
+  <script src="content.js"></script>
+  <script src="app.js?v=4"></script>
+</body>
+</html>
