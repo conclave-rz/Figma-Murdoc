@@ -218,33 +218,25 @@ Desde 2026 el MCP oficial de Figma también escribe en el canvas (`use_figma`, `
 
 ## Instalación
 
-### 1. Clonar el repo
+> ¿Ya tenías Murdoc v2? Sigue [TEAM-UPDATE-2026-10.md](TEAM-UPDATE-2026-10.md) en vez de esta sección.
+
+### 1. Clonar, instalar y compilar
 ```bash
-git clone https://github.com/Razyel-Soma/figma-Murdoc.git
+git clone https://github.com/conclave-rz/figma-Murdoc.git
 cd figma-Murdoc
 npm install
-```
-
-### 2. Instalar el plugin en Figma Desktop
-
-> **Importa siempre `~/.figma-console-mcp/plugin/manifest.json`** (en macOS: `/Users/<tú>/.figma-console-mcp/plugin/manifest.json`; en el selector, ⌘⇧G para llegar a la carpeta oculta). Murdoc actualiza esa carpeta cada vez que arranca. Si importaste el plugin desde otra copia (un clon viejo del repo), Figma seguirá corriendo ese código aunque actualices Murdoc: `figma_get_status` lo muestra como `pluginVersion` distinto de `bundledPluginVersion`. Solución: elimina el plugin en *Manage plugins in development* y reimporta desde la ruta estable.
-
-1. Abre Figma Desktop
-2. Ve a `Plugins → Development → Import plugin from manifest...`
-3. Selecciona el archivo:
-```
-figma-Murdoc/figma-desktop-bridge/manifest.json
-```
-4. El plugin aparecerá como **"Figma Desktop Bridge"**
-
-### 3. Compilar el servidor
-```bash
 npm run build:local
 ```
+Para la captura viva de `figma_capture_html` y la verificación de `generate-docsite` necesitas Google Chrome instalado.
 
-### 4. Conectar con Claude Desktop
+### 2. Registrar el servidor MCP
 
-Edita `~/.claude.json` y añade:
+**Claude Code** (una vez, para todas tus sesiones):
+```bash
+claude mcp add figma-console -s user -e FIGMA_ACCESS_TOKEN=figd_TU_TOKEN -- node /ruta/a/figma-Murdoc/dist/local.js
+```
+
+**Claude Desktop**: edita `~/Library/Application Support/Claude/claude_desktop_config.json`:
 ```json
 {
   "mcpServers": {
@@ -259,17 +251,24 @@ Edita `~/.claude.json` y añade:
   }
 }
 ```
+Reemplaza `/ruta/a/` con la ruta real. El token es opcional (habilita funciones de REST API como versiones y comentarios). Reinicia la app (⌘Q y abrir).
 
-Reemplaza `/ruta/a/` con la ruta real. El token es opcional pero habilita REST API features. Reinicia Claude Desktop.
+### 3. Instalar el plugin en Figma Desktop
 
-### 5. Verificar la instalación
+Al arrancar, Murdoc copia el plugin a una **ruta estable** que se actualiza sola en cada versión. Importa siempre desde ahí, **no** desde la carpeta `figma-desktop-bridge/` del repo:
 
-En Claude Desktop escribe:
-```
-list_skills
-```
+1. Abre Claude (paso 2) al menos una vez para que se cree la carpeta.
+2. En Figma Desktop: `Plugins → Development → Import plugin from manifest...`
+3. Presiona **⌘⇧G**, pega `~/.figma-console-mcp/plugin/` y elige **manifest.json**.
+4. Abre el plugin: `Plugins → Development → Figma Desktop Bridge`.
 
-Deberías ver los 27 skills disponibles.
+Si ya tenías un "Figma Desktop Bridge" importado desde otra ruta, elimínalo antes en `Plugins → Development → Manage plugins in development`: Figma usaría ese código viejo aunque actualices Murdoc.
+
+### 4. Verificar la instalación
+
+Pide a Claude: *"corre figma_get_status y list_skills"*. Debes ver:
+- `pluginVersion: "3.0.0"` igual a `bundledPluginVersion: "3.0.0"`
+- 27 skills disponibles
 
 ## Flujo de misión (orquestación)
 
