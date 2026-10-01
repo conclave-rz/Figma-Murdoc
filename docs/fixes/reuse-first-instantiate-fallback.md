@@ -1,5 +1,8 @@
 # Fix handoff — `figma_instantiate_component` cuelga en archivos `dynamic-page`
 
+> **Actualización v3 (2026-10-01) — causa real verificada en vivo.** La hipótesis de abajo (dynamic-page) era incorrecta: el cuelgue se reproducía incluso con el componente en la página actual. El handler intentaba **primero** `importComponentByKeyAsync(componentKey)`; con un componente local no publicado esa promesa no resuelve, el handler esperaba su propio timeout de 15 s y el servidor cortaba a los 15 s, antes de llegar al fallback por `nodeId`. Prueba: la misma llamada **solo con `nodeId`** respondió al instante. Además, **las llamadas con timeout creaban la instancia después**, huérfana. Fix en el bridge v3: resolver el `nodeId` local primero, timeouts de import de 10 s y 25 s del lado del servidor. El helper `reuseComponent()` sigue siendo válido y es la ruta por defecto de `reuse-first`.
+
+
 **Aplica en:** Claude Code (donde el filesystem del skill es alcanzable).
 **Contexto:** verificado en aislamiento. La tool dedicada `figma_instantiate_component` (con `componentKey` + `nodeId` válidos) se cuelga y revienta con `INSTANTIATE_COMPONENT timed out after 15000ms`. El control crudo `comp.createInstance()` vía `figma_execute` funciona en ~12ms. La API de Figma está sana; el defecto vive en el handler del bridge.
 
