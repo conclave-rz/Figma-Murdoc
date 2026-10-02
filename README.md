@@ -9,7 +9,7 @@ Fork del [Figma Console MCP](https://github.com/southleft/figma-console-mcp) ext
 - **Pack de ALX**: `hu-alx` (Historias de Usuario), `docu-alx` (micrositio de HU), `generate-docsite` (sitio de documentación estilo Pattern Lab) y `ai-ready-audit` (scorecard de 8 dimensiones, también sobre Figma). Ver [CREDITS.md](CREDITS.md).
 - **Loader de skills v3**: skills en carpeta con `references/` por fase y `assets/`, frontmatter, y nombres validados.
 - **Skills migradas a tools nativas**: `sync-tokens` y `apply-contract` usan `figma_export_tokens`/`figma_import_tokens`; las de slots ya crean y pueblan slots; `reuse-first` tiene búsqueda de respaldo.
-- **Autónomo**: todo corre por el Desktop Bridge, sin cuotas ni seat Full. No depende del MCP oficial de Figma (ver más abajo).
+- **Autónomo**: todo corre por el Desktop Bridge, sin cuotas por llamada ni cobro por uso. Respeta los mismos permisos que tu cuenta de Figma (ver "Permisos" más abajo). No depende del MCP oficial.
 
 ## Qué añade este fork
 
@@ -198,7 +198,19 @@ Murdoc puede auditar, reestructurar y migrar componentes a slots de punta a punt
 
 ## Murdoc y el MCP oficial de Figma
 
-Desde 2026 el MCP oficial de Figma también escribe en el canvas (`use_figma`, `generate_figma_design`), pero exige seat Full para escribir, tiene cuotas de lectura (p. ej. 200 llamadas/día en Professional), limita las respuestas a 20 KB y anunció cobro por uso al terminar la beta. Murdoc corre todo por el Desktop Bridge local: sin cuotas, sin seat Full y sin depender del oficial.
+Desde 2026 el MCP oficial de Figma también escribe en el canvas (`use_figma`, `generate_figma_design`), pero exige seat Full para escribir, tiene cuotas de lectura (p. ej. 200 llamadas/día en Professional), limita las respuestas a 20 KB y anunció cobro por uso al terminar la beta. Murdoc corre todo por el Desktop Bridge local: sin cuotas por llamada, sin tope de respuesta de 20 KB, sin cobro por uso y sin depender del oficial.
+
+### Permisos: Murdoc no ahorra licencias
+
+El Desktop Bridge es un plugin de Figma y corre **con los permisos de quien lo abre**. No es una forma de editar sin licencia de editor:
+
+| Tu acceso al archivo | Qué puede hacer Murdoc |
+|---|---|
+| Puedes editar (seat Full en archivos de Design; en Starter, tus drafts) | Leer y escribir |
+| Dev Mode (seat Dev) | Solo lectura: el plugin corre en modo `inspect` |
+| Viewer | Figma no deja ejecutar el plugin. Solo funcionan las tools de REST API (con tu token), y solo en lo que tu cuenta puede ver |
+
+Lo que Murdoc evita frente al oficial son las **cuotas, los topes y el cobro por llamada**, no los seats. Si puedes editar un archivo a mano, Murdoc puede editarlo; si no puedes, Murdoc tampoco.
 
 | Necesidad | Oficial | Murdoc |
 |---|---|---|
